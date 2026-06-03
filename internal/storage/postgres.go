@@ -49,6 +49,7 @@ func (s *Store) Close() {
 // InsertBatch writes multiple logs in a single network round-trip.
 // This is critical for LogStream's performance.
 // InsertBatch writes multiple logs in a single network round-trip.
+// InsertBatch writes multiple logs in a single network round-trip.
 func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 	if len(logs) == 0 {
 		return nil
@@ -66,14 +67,14 @@ func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 		batch.Queue(query, log.Timestamp, log.Level, log.Service, log.Message, log.Metadata)
 	}
 
-	br := s.pool.SendBatch(context.Background(), batch)
+	br := s.pool.SendBatch(ctx, batch)
+
+	defer br.Close()
 
 	for i := 0; i < len(logs); i++ {
 		_, err := br.Exec()
 		if err != nil {
-
-			fmt.Printf("Oops, failed inserting log: %v\n", err)
-			break
+			return fmt.Errorf("failed inserting log at index %d: %w", i, err)
 		}
 	}
 
