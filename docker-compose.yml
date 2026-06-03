@@ -1,0 +1,24 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: logstream-postgres
+    environment:
+      POSTGRES_USER: logstream
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: logstream
+    ports:
+      - "5433:5432" # Mapped to 5433 to avoid conflicts with other local DBs
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logstream"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
