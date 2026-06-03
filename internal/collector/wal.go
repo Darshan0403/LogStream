@@ -9,12 +9,15 @@ import (
 )
 
 // Append writes a batch of logs to the WAL file before database insertion.
-func AppendToWAL(batch []models.LogEntry) error {
+// internal/collector/wal.go
 
+// Append writes a batch of logs to the WAL file before database insertion.
+func AppendToWAL(batch []models.LogEntry) error {
 	f, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
 	b, err := json.Marshal(batch)
 	if err != nil {
@@ -28,7 +31,6 @@ func AppendToWAL(batch []models.LogEntry) error {
 		return err
 	}
 
-	// Force write to disk
 	return f.Sync()
 }
 

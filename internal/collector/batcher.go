@@ -28,9 +28,14 @@ func (b *Batcher) Send(entry models.LogEntry) {
 }
 
 // Run executes in a single background goroutine
-func (b *Batcher) Run(ctx context.Context) {
+// internal/collector/batcher.go
 
+// Run executes in a single background goroutine
+func (b *Batcher) Run(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
+	// FIX 2: Prevent Ticker Leak
+	defer ticker.Stop()
+
 	var buf []models.LogEntry
 
 	for {
@@ -47,8 +52,14 @@ func (b *Batcher) Run(ctx context.Context) {
 				buf = nil
 			}
 		case <-ctx.Done():
-
-			fmt.Println("Batcher shutting down...")
+			// FIX 3: Prevent Data Loss on Shutdown
+			// We MUST flush whatever is left in memory before we exit.
+			// We use context.Background() here because the parent ctx is already canceled.
+			if len(buf) > 0 {
+				fmt.Printf("Shutting down: Flushing final %d logs...\n", len(buf))
+				b.flush(context.Background(), buf)
+			}
+			fmt.Println("Batcher shut down gracefully.")
 			return
 		}
 	}
@@ -56,13 +67,17 @@ func (b *Batcher) Run(ctx context.Context) {
 
 func (b *Batcher) flush(ctx context.Context, batch []models.LogEntry) {
 	if err := AppendToWAL(batch); err != nil {
-		fmt.Printf("WAL error: %v\n", err)
+		// In a real app, we might use a robust logger, but we shouldn't crash the batcher
+		fmt.Printf("CRITICAL - WAL error: %v\n", err)
 	}
 
 	if err := b.store.InsertBatch(ctx, batch); err != nil {
-		fmt.Printf("DB Insert error: %v\n", err)
-		return
+		fmt.Printf("CRITICAL - DB Insert error: %v\n", err)
+		return // If DB fails, we leave the WAL file intact so it can be replayed on reboot
 	}
 
-	TruncateWAL()
+	// Only clear the WAL if the DB insert succeeded
+	if err := TruncateWAL(); err != nil {
+		fmt.Printf("ERROR - Failed to truncate WAL: %v\n", err)
+	}
 }
