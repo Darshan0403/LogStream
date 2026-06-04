@@ -78,10 +78,20 @@ func (a *API) searchHandler(w http.ResponseWriter, r *http.Request) {
 
 	var from, to time.Time
 	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
-		from, _ = time.Parse(time.RFC3339, fromStr)
+		var err error
+		from, err = time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			http.Error(w, "Invalid 'from' timestamp. Must be RFC3339 format", http.StatusBadRequest)
+			return
+		}
 	}
 	if toStr := r.URL.Query().Get("to"); toStr != "" {
-		to, _ = time.Parse(time.RFC3339, toStr)
+		var err error
+		to, err = time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			http.Error(w, "Invalid 'to' timestamp. Must be RFC3339 format", http.StatusBadRequest)
+			return
+		}
 	}
 
 	logs, total, err := a.store.Search(r.Context(), q, service, level, from, to, limit, offset)

@@ -37,7 +37,7 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// ParseBatch handles both single JSON objects and arrays
 	entries, err := h.parser.ParseBatch(body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Failed to parse log payload: %v", err), http.StatusBadRequest)
 		return
 	}
 
