@@ -26,3 +26,16 @@ type AlertRule struct {
 	IsActive        bool      `json:"is_active"`
 	CreatedAt       time.Time `json:"created_at"`
 }
+
+// HourCount represents log volume aggregated into 1-hour windows
+type HourCount struct {
+	Hour  time.Time `json:"hour"`
+	Count int64     `json:"count"`
+}
+
+// StatsResult bundles distinct data sets for metric visualizations
+type StatsResult struct {
+	CountByLevel   map[string]int64 `json:"count_by_level"`
+	CountByService map[string]int64 `json:"count_by_service"`
+	LogsPerHour    []HourCount      `json:"logs_per_hour"`
+}
