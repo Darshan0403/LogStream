@@ -5,23 +5,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/logstream/internal/alerts"
 	"github.com/logstream/internal/models"
 	"github.com/logstream/internal/storage"
 )
 
 // API holds the dependencies for the HTTP handlers
 type API struct {
-	store *storage.Store
+	store  *storage.Store
+	engine *alerts.Engine
 }
 
 // NewRouter constructs the chi router, mounts middleware, and registers all endpoints
-func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string) http.Handler {
+func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, engine *alerts.Engine) http.Handler {
 	r := chi.NewRouter()
-	api := &API{store: store}
+	api := &API{store: store, engine: engine}
 
 	// Global Middleware
 	r.Use(Recoverer)
@@ -40,6 +44,11 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string) 
 		r.Get("/logs/{id}", api.getLogHandler)
 		r.Get("/logs/stats", api.statsHandler)
 		r.Get("/services", api.servicesHandler)
+		r.Post("/rules", api.createRuleHandler)
+		r.Get("/rules", api.listRulesHandler)
+		r.Put("/rules/{id}", api.updateRuleHandler)
+		r.Delete("/rules/{id}", api.deleteRuleHandler)
+		r.Get("/alerts", api.listAlertsHandler)
 	})
 
 	return r
@@ -166,4 +175,128 @@ func (a *API) servicesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, services)
+}
+
+// --- Alert Handlers ---
+
+func (a *API) createRuleHandler(w http.ResponseWriter, r *http.Request) {
+	var rule models.AlertRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if rule.Name == "" || rule.Pattern == "" {
+		http.Error(w, "name and pattern are required", http.StatusBadRequest)
+		return
+	}
+
+	if _, err := regexp.Compile(rule.Pattern); err != nil {
+		http.Error(w, fmt.Sprintf("invalid regex pattern: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	created, err := a.store.CreateRule(r.Context(), rule)
+	if err != nil {
+		http.Error(w, "Failed to create rule", http.StatusInternalServerError)
+		return
+	}
+
+	// Hot-reload the engine cache
+	a.engine.LoadRules(r.Context())
+	respondJSON(w, http.StatusCreated, created)
+}
+
+func (a *API) listRulesHandler(w http.ResponseWriter, r *http.Request) {
+	rules, err := a.store.ListRules(r.Context())
+	if err != nil {
+		http.Error(w, "Failed to list rules", http.StatusInternalServerError)
+		return
+	}
+	if rules == nil {
+		rules = []models.AlertRule{}
+	}
+	respondJSON(w, http.StatusOK, rules)
+}
+
+func (a *API) updateRuleHandler(w http.ResponseWriter, r *http.Request) {
+	idParam := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idParam)
+	if err != nil {
+		http.Error(w, "Invalid rule ID", http.StatusBadRequest)
+		return
+	}
+
+	var rule models.AlertRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	updated, err := a.store.UpdateRule(r.Context(), id, rule)
+	if err != nil {
+		http.Error(w, "Failed to update rule", http.StatusInternalServerError)
+		return
+	}
+
+	a.engine.LoadRules(r.Context())
+	respondJSON(w, http.StatusOK, updated)
+}
+
+func (a *API) deleteRuleHandler(w http.ResponseWriter, r *http.Request) {
+	idParam := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idParam)
+	if err != nil {
+		http.Error(w, "Invalid rule ID", http.StatusBadRequest)
+		return
+	}
+
+	if err := a.store.DeleteRule(r.Context(), id); err != nil {
+		http.Error(w, "Failed to delete rule", http.StatusInternalServerError)
+		return
+	}
+
+	a.engine.LoadRules(r.Context())
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) listAlertsHandler(w http.ResponseWriter, r *http.Request) {
+	to := time.Now()
+	from := to.Add(-24 * time.Hour)
+
+	if fromStr := r.URL.Query().Get("from"); fromStr != "" {
+		if p, err := time.Parse(time.RFC3339, fromStr); err == nil {
+			from = p
+		}
+	}
+	if toStr := r.URL.Query().Get("to"); toStr != "" {
+		if p, err := time.Parse(time.RFC3339, toStr); err == nil {
+			to = p
+		}
+	}
+
+	limit := 50
+	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
+		limit = l
+	}
+
+	var ruleIDFilter *uuid.UUID
+	if ruleIDStr := r.URL.Query().Get("rule_id"); ruleIDStr != "" {
+		if id, err := uuid.Parse(ruleIDStr); err == nil {
+			ruleIDFilter = &id
+		}
+	}
+
+	alertsList, err := a.store.ListAlerts(r.Context(), ruleIDFilter, from, to, limit)
+	if err != nil {
+		http.Error(w, "Failed to list alerts", http.StatusInternalServerError)
+		return
+	}
+	if alertsList == nil {
+		alertsList = []models.AlertWithContext{}
+	}
+
+	respondJSON(w, http.StatusOK, alertsList)
 }

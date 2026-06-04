@@ -19,10 +19,11 @@ type compiledRule struct {
 }
 
 type Engine struct {
-	store     *storage.Store
-	cache     map[uuid.UUID]*compiledRule
-	mu        sync.RWMutex
-	lastFired map[uuid.UUID]time.Time
+	store      *storage.Store
+	cache      map[uuid.UUID]*compiledRule
+	cacheMu    sync.RWMutex // Protects the regex cache
+	lastFired  map[uuid.UUID]time.Time
+	cooldownMu sync.Mutex // Protects the lastFired map
 }
 
 func NewEngine(store *storage.Store) *Engine {
@@ -57,62 +58,53 @@ func (e *Engine) LoadRules(ctx context.Context) error {
 		}
 	}
 
-	// Correctly acquiring a full Write Lock to swap the cache safely
-	e.mu.Lock()
+	e.cacheMu.Lock()
 	e.cache = newCache
-	e.mu.Unlock()
+	e.cacheMu.Unlock()
 
 	fmt.Printf("Alert Engine: Loaded %d active rules.\n", len(newCache))
 	return nil
 }
 
 func (e *Engine) Check(ctx context.Context, batch []models.LogEntry) {
-	// We use a Read Lock here because multiple batcher goroutines might be
-	// evaluating logs against the cache at the same time.
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.cacheMu.RLock()
+	defer e.cacheMu.RUnlock()
 
 	now := time.Now()
 
 	for _, cr := range e.cache {
 		for _, log := range batch {
-			// 1. Check Filters
 			if cr.rule.LevelFilter != nil && *cr.rule.LevelFilter != log.Level {
 				continue
 			}
 			if cr.rule.ServiceFilter != nil && *cr.rule.ServiceFilter != log.Service {
 				continue
 			}
-
-			// 2. Pattern Match
 			if !cr.regex.MatchString(log.Message) {
 				continue
 			}
 
-			// 3. Cooldown Check
+			// Lock the cooldown map for reading and writing
+			e.cooldownMu.Lock()
 			lastTime := e.lastFired[cr.rule.ID]
 			cooldownDuration := time.Duration(cr.rule.CooldownMinutes) * time.Minute
+
 			if now.Sub(lastTime) < cooldownDuration {
+				e.cooldownMu.Unlock()
 				continue
 			}
 
-			// 4. Fire Alert
+			// Fire Alert and update cooldown safely
 			if err := e.store.CreateAlert(ctx, cr.rule.ID, log.ID, log.Timestamp); err != nil {
 				fmt.Printf("ERROR: Failed to save alert for rule '%s': %v\n", cr.rule.Name, err)
+				e.cooldownMu.Unlock()
 				continue
 			}
 
-			fmt.Printf("🔔 ALERT [%s]: '%s' matched log #%d from %s\n", cr.rule.Name, cr.rule.Pattern, log.ID, log.Service)
-
-			// --- THE TRAP ---
-			// We only hold `e.mu.RLock()` (Read Lock), but we are WRITING to the lastFired map.
-			// Go maps are NOT thread-safe for writes. If two different batches trigger
-			// an alert at the exact same time, the Go runtime will instantly crash the
-			// whole server with a fatal "concurrent map writes" panic.
 			e.lastFired[cr.rule.ID] = now
+			e.cooldownMu.Unlock()
 
-			// Once a rule fires, we break out of the log loop so we don't
-			// spam multiple alerts for the same rule in a single batch
+			fmt.Printf("🔔 ALERT [%s]: '%s' matched log #%d from %s\n", cr.rule.Name, cr.rule.Pattern, log.ID, log.Service)
 			break
 		}
 	}

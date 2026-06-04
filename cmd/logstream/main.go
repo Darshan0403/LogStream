@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/logstream/internal/alerts"
 	"github.com/logstream/internal/api"
 	"github.com/logstream/internal/collector"
 	"github.com/logstream/internal/parser"
@@ -63,15 +64,21 @@ func main() {
 	}
 
 	// 4. Wire Dependencies
+
+	alertEngine := alerts.NewEngine(store)
+	if err := alertEngine.LoadRules(ctx); err != nil {
+		fmt.Printf("WARNING: Failed to load alert rules on startup: %v\n", err)
+	}
+
 	jsonParser := &parser.JSONParser{}
-	batcher := collector.NewBatcher(store, wal)
+	batcher := collector.NewBatcher(store, wal, alertEngine)
 	httpHandler := collector.NewHTTPHandler(batcher, jsonParser)
 
 	// 5. Start the Batcher Goroutine
 	go batcher.Run(ctx)
 
 	// 6. Setup API Router
-	router := api.NewRouter(store, httpHandler, apiKey)
+	router := api.NewRouter(store, httpHandler, apiKey, alertEngine)
 
 	server := &http.Server{
 		Addr:    ":8090",
