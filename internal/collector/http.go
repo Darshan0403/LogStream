@@ -2,6 +2,7 @@
 package collector
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 
@@ -33,15 +34,19 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	entry, err := h.parser.Parse(body)
+	// ParseBatch handles both single JSON objects and arrays
+	entries, err := h.parser.ParseBatch(body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Failed to parse log payload: %v", err), http.StatusBadRequest)
 		return
 	}
 
-	// Push to the channel. This is non-blocking as long as the 10K buffer isn't full.
-	h.batcher.Send(entry)
+	// Push each entry to the batcher channel
+	for _, entry := range entries {
+		h.batcher.Send(entry)
+	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"status":"accepted"}`))
+	fmt.Fprintf(w, `{"status":"accepted","ingested":%d}`, len(entries))
 }

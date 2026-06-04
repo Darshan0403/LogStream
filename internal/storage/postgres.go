@@ -47,9 +47,7 @@ func (s *Store) Close() {
 }
 
 // InsertBatch writes multiple logs in a single network round-trip.
-// This is critical for LogStream's performance.
-// InsertBatch writes multiple logs in a single network round-trip.
-// InsertBatch writes multiple logs in a single network round-trip.
+// This is the core performance optimization — one SendBatch call for N inserts.
 func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 	if len(logs) == 0 {
 		return nil
