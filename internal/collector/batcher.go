@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/logstream/internal/alerts"
 	"github.com/logstream/internal/models"
 	"github.com/logstream/internal/storage"
 )
@@ -14,18 +15,20 @@ import (
 // and flushes them to the database in batches. A single goroutine drains the
 // channel — Go's channel semantics provide synchronization and backpressure.
 type Batcher struct {
-	ch    chan models.LogEntry
-	store *storage.Store
-	wal   *WAL
-	done  chan struct{} // closed when Run() exits after final flush
+	ch     chan models.LogEntry
+	store  *storage.Store
+	wal    *WAL
+	engine *alerts.Engine // NEW: Alert engine dependency
+	done   chan struct{}  // closed when Run() exits after final flush
 }
 
-func NewBatcher(store *storage.Store, wal *WAL) *Batcher {
+func NewBatcher(store *storage.Store, wal *WAL, engine *alerts.Engine) *Batcher {
 	return &Batcher{
-		ch:    make(chan models.LogEntry, 10000), // Buffer handles sudden spikes
-		store: store,
-		wal:   wal,
-		done:  make(chan struct{}),
+		ch:     make(chan models.LogEntry, 10000), // Buffer handles sudden spikes
+		store:  store,
+		wal:    wal,
+		engine: engine, // NEW
+		done:   make(chan struct{}),
 	}
 }
 
@@ -98,5 +101,10 @@ func (b *Batcher) flush(ctx context.Context, batch []models.LogEntry) {
 	// Only clear the WAL after successful DB insert
 	if err := b.wal.Truncate(); err != nil {
 		fmt.Printf("ERROR - Failed to truncate WAL: %v\n", err)
+	}
+
+	// NEW: Check alerts after successful insert (using the IDs returned by Postgres)
+	if b.engine != nil {
+		b.engine.Check(ctx, batch)
 	}
 }

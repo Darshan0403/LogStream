@@ -48,15 +48,19 @@ func (s *Store) Close() {
 
 // InsertBatch writes multiple logs in a single network round-trip.
 // This is the core performance optimization — one SendBatch call for N inserts.
+// InsertBatch writes multiple logs in a single network round-trip.
+// Now uses RETURNING id to populate the slice for the Alert Engine.
 func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 	if len(logs) == 0 {
 		return nil
 	}
 
 	batch := &pgx.Batch{}
+
+	// FIX: Added RETURNING id to the query
 	query := `
 		INSERT INTO logs (timestamp, level, service, message, metadata) 
-		VALUES ($1, $2, $3, $4, $5)`
+		VALUES ($1, $2, $3, $4, $5) RETURNING id`
 
 	for _, log := range logs {
 		if log.Timestamp.IsZero() {
@@ -66,11 +70,12 @@ func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 	}
 
 	br := s.pool.SendBatch(ctx, batch)
-
+	// Safe to defer Close here; it cleans up if we error out early
 	defer br.Close()
 
 	for i := 0; i < len(logs); i++ {
-		_, err := br.Exec()
+		// FIX: Replaced Exec() with QueryRow().Scan() to capture the generated ID
+		err := br.QueryRow().Scan(&logs[i].ID)
 		if err != nil {
 			return fmt.Errorf("failed inserting log at index %d: %w", i, err)
 		}

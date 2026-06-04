@@ -39,3 +39,16 @@ type StatsResult struct {
 	CountByService map[string]int64 `json:"count_by_service"`
 	LogsPerHour    []HourCount      `json:"logs_per_hour"`
 }
+
+// AlertWithContext joins a fired alert with its triggering rule and the actual log entry
+type AlertWithContext struct {
+	ID       uuid.UUID `json:"id"`
+	RuleID   uuid.UUID `json:"rule_id"`
+	LogID    int64     `json:"log_id"`
+	FiredAt  time.Time `json:"fired_at"`
+	RuleName string    `json:"rule_name"`
+	Pattern  string    `json:"pattern"`
+	Level    string    `json:"level"`
+	Service  string    `json:"service"`
+	Message  string    `json:"message"`
+}
