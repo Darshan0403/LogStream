@@ -204,7 +204,9 @@ func (a *API) createRuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Hot-reload the engine cache
-	a.engine.LoadRules(r.Context())
+	if err := a.engine.LoadRules(r.Context()); err != nil {
+		fmt.Printf("WARNING: Failed to reload alert rules: %v\n", err)
+	}
 	respondJSON(w, http.StatusCreated, created)
 }
 
@@ -235,13 +237,20 @@ func (a *API) updateRuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	if _, err := regexp.Compile(rule.Pattern); err != nil {
+		http.Error(w, fmt.Sprintf("invalid regex pattern: %v", err), http.StatusBadRequest)
+		return
+	}
+
 	updated, err := a.store.UpdateRule(r.Context(), id, rule)
 	if err != nil {
 		http.Error(w, "Failed to update rule", http.StatusInternalServerError)
 		return
 	}
 
-	a.engine.LoadRules(r.Context())
+	if err := a.engine.LoadRules(r.Context()); err != nil {
+		fmt.Printf("WARNING: Failed to reload alert rules: %v\n", err)
+	}
 	respondJSON(w, http.StatusOK, updated)
 }
 
@@ -258,7 +267,9 @@ func (a *API) deleteRuleHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.engine.LoadRules(r.Context())
+	if err := a.engine.LoadRules(r.Context()); err != nil {
+		fmt.Printf("WARNING: Failed to reload alert rules: %v\n", err)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
