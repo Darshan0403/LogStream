@@ -20,12 +20,14 @@ import (
 type API struct {
 	store  *storage.Store
 	engine *alerts.Engine
+	hub    *Hub   // NEW
+	apiKey string // NEW: Storing apiKey here so the websocket handler can validate it
 }
 
 // NewRouter constructs the chi router, mounts middleware, and registers all endpoints
-func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, engine *alerts.Engine) http.Handler {
+func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, engine *alerts.Engine, hub *Hub) http.Handler {
 	r := chi.NewRouter()
-	api := &API{store: store, engine: engine}
+	api := &API{store: store, engine: engine, hub: hub, apiKey: apiKey}
 
 	// Global Middleware
 	r.Use(Recoverer)
@@ -35,6 +37,11 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, 
 	// Public Routes
 	r.Get("/health", api.healthHandler)
 	r.Post("/ingest", ingestHandler.ServeHTTP)
+
+	// NEW: WebSocket Route (Public, validates via query param)
+	r.Get("/ws/tail", func(w http.ResponseWriter, r *http.Request) {
+		api.hub.ServeWS(w, r, api.apiKey)
+	})
 
 	// Protected API Routes
 	r.Route("/api", func(r chi.Router) {

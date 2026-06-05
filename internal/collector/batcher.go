@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/logstream/internal/alerts"
+	"github.com/logstream/internal/api"
 	"github.com/logstream/internal/models"
 	"github.com/logstream/internal/storage"
 )
@@ -18,16 +19,18 @@ type Batcher struct {
 	ch     chan models.LogEntry
 	store  *storage.Store
 	wal    *WAL
-	engine *alerts.Engine // NEW: Alert engine dependency
+	engine *alerts.Engine // Alert engine dependency
+	hub    *api.Hub       // NEW: WebSocket Hub dependency
 	done   chan struct{}  // closed when Run() exits after final flush
 }
 
-func NewBatcher(store *storage.Store, wal *WAL, engine *alerts.Engine) *Batcher {
+func NewBatcher(store *storage.Store, wal *WAL, engine *alerts.Engine, hub *api.Hub) *Batcher {
 	return &Batcher{
 		ch:     make(chan models.LogEntry, 10000), // Buffer handles sudden spikes
 		store:  store,
 		wal:    wal,
-		engine: engine, // NEW
+		engine: engine,
+		hub:    hub, // NEW
 		done:   make(chan struct{}),
 	}
 }
@@ -103,8 +106,13 @@ func (b *Batcher) flush(ctx context.Context, batch []models.LogEntry) {
 		fmt.Printf("ERROR - Failed to truncate WAL: %v\n", err)
 	}
 
-	// NEW: Check alerts after successful insert (using the IDs returned by Postgres)
+	// Check alerts after successful insert (using the IDs returned by Postgres)
 	if b.engine != nil {
 		b.engine.Check(ctx, batch)
+	}
+
+	// NEW: Broadcast to WebSocket clients
+	if b.hub != nil {
+		b.hub.Broadcast(batch)
 	}
 }
