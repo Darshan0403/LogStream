@@ -36,7 +36,7 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, 
 
 	// Public Routes
 	r.Get("/health", api.healthHandler)
-	r.Post("/ingest", ingestHandler.ServeHTTP)
+	r.With(RateLimit).Post("/ingest", ingestHandler.ServeHTTP)
 
 	// NEW: WebSocket Route (Public, validates via query param)
 	r.Get("/ws/tail", func(w http.ResponseWriter, r *http.Request) {
