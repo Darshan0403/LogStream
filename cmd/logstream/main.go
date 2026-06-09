@@ -69,6 +69,16 @@ func buildServeCmd() *cobra.Command {
 				}
 			}
 
+			// INGEST_ENABLED controls whether POST /ingest accepts logs.
+			// Set to "false" for read-only public deployments.
+			// Defaults to true (dev mode, dogfooding, load tests).
+			ingestEnabled := os.Getenv("INGEST_ENABLED") != "false"
+			if ingestEnabled {
+				fmt.Println("Ingestion: ENABLED (set INGEST_ENABLED=false for read-only mode)")
+			} else {
+				fmt.Println("Ingestion: DISABLED — read-only deployment mode")
+			}
+
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
@@ -110,7 +120,7 @@ func buildServeCmd() *cobra.Command {
 			jsonParser := &parser.JSONParser{}
 			// UPDATED: Pass hub to Batcher
 			batcher := collector.NewBatcher(store, wal, alertEngine, hub)
-			httpHandler := collector.NewHTTPHandler(batcher, jsonParser)
+			httpHandler := collector.NewHTTPHandler(batcher, jsonParser, ingestEnabled)
 
 			// 5. Start the Batcher Goroutine
 			go batcher.Run(ctx)

@@ -62,11 +62,46 @@ func (s *StdinCollector) Run(ctx context.Context) {
 		close(lines)
 	}()
 
+	var buffer strings.Builder
+
+	// Helper closure to process whatever is currently in the multi-line buffer
+	processBuffer := func() {
+		if buffer.Len() == 0 {
+			return
+		}
+
+		rawLog := buffer.String()
+		buffer.Reset()
+
+		// Parse the accumulated multi-line block
+		entry, err := s.parser.Parse([]byte(rawLog))
+		if err != nil {
+			fmt.Printf("[collect:%s] PARSE FAIL: %v | line: %.80s\n", s.service, err, rawLog)
+			return
+		}
+
+		// Skip entries with empty messages
+		if entry.Message == "" {
+			return
+		}
+
+		// Inject service name if the parser didn't set one
+		if entry.Service == "" {
+			entry.Service = s.service
+		}
+
+		linesParsed++
+		batch = append(batch, entry)
+	}
+
 	for {
 		select {
 		case line, ok := <-lines:
 			if !ok {
-				// EOF reached, flush remaining and exit
+				// EOF reached: process the final log sitting in the buffer
+				processBuffer()
+
+				// Flush any remaining logs in the batch
 				if len(batch) > 0 {
 					s.flush(batch)
 				}
@@ -76,37 +111,32 @@ func (s *StdinCollector) Run(ctx context.Context) {
 
 			linesRead++
 
-			// Skip empty lines
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
+			// Check if the line is completely empty (we ignore pure empty lines)
+			if strings.TrimSpace(line) == "" {
 				continue
 			}
 
-			// Parse the single line directly — stdin is always one line at a time.
-			// (ParseBatch was a no-op here because DockerParser.ParseBatch swallows
-			// errors and returns empty slices, making the fallback to Parse dead code.)
-			entry, err := s.parser.Parse([]byte(trimmed))
-			if err != nil {
-				fmt.Printf("[collect:%s] PARSE FAIL: %v | line: %.80s\n", s.service, err, trimmed)
-				continue
+			// MULTI-LINE LOGIC: If it starts with space or tab, it belongs to the previous line!
+			if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+				if buffer.Len() > 0 {
+					buffer.WriteString("\n" + line)
+				} else {
+					// Fallback: If it's the very first line ever received, just start the buffer
+					buffer.WriteString(line)
+				}
+			} else {
+				// It doesn't start with whitespace, which means it's a BRAND NEW log.
+				// First, process and clear out the old log in the buffer.
+				processBuffer()
+
+				// Then start buffering the new log
+				buffer.WriteString(line)
 			}
 
-			// Skip entries with empty messages (blank lines that parsed as empty)
-			if entry.Message == "" {
-				continue
-			}
-
-			// Inject service name if the parser didn't set one
-			if entry.Service == "" {
-				entry.Service = s.service
-			}
-
-			linesParsed++
-			batch = append(batch, entry)
-
+			// Only flush the batch if it hits the size limit
 			if len(batch) >= 50 {
 				s.flush(batch)
-				batch = nil
+				batch = nil // Reset batch allocation
 			}
 
 		case <-ticker.C:
@@ -116,6 +146,8 @@ func (s *StdinCollector) Run(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
+			// Process whatever was left hanging in the buffer when context was cancelled
+			processBuffer()
 			if len(batch) > 0 {
 				s.flush(batch)
 			}
@@ -156,4 +188,3 @@ func (s *StdinCollector) flush(entries []models.LogEntry) {
 		fmt.Printf("[collect:%s] Flushed %d logs → %s (HTTP %d)\n", s.service, len(entries), s.serverURL, resp.StatusCode)
 	}
 }
-

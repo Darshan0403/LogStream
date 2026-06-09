@@ -36,7 +36,7 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, 
 
 	// Public Routes
 	r.Get("/health", api.healthHandler)
-	r.With(RateLimit).Post("/ingest", ingestHandler.ServeHTTP)
+	r.Post("/ingest", ingestHandler.ServeHTTP)
 
 	// NEW: WebSocket Route (Public, validates via query param)
 	r.Get("/ws/tail", func(w http.ResponseWriter, r *http.Request) {
@@ -46,6 +46,7 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, 
 	// Protected API Routes
 	r.Route("/api", func(r chi.Router) {
 		r.Use(APIKeyAuth(apiKey))
+		r.Use(RateLimit) // 100 req/sec per IP — protects read endpoints only
 
 		r.Get("/logs", api.searchHandler)
 		r.Get("/logs/{id}", api.getLogHandler)
@@ -295,19 +296,22 @@ func (a *API) listAlertsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	limit := 50
+	limit := 50 // Standardized to 50 for pagination
 	if l, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && l > 0 {
 		limit = l
 	}
 
-	var ruleIDFilter *uuid.UUID
-	if ruleIDStr := r.URL.Query().Get("rule_id"); ruleIDStr != "" {
-		if id, err := uuid.Parse(ruleIDStr); err == nil {
-			ruleIDFilter = &id
-		}
+	offset := 0
+	if o, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && o >= 0 {
+		offset = o
 	}
 
-	alertsList, err := a.store.ListAlerts(r.Context(), ruleIDFilter, from, to, limit)
+	ruleID := r.URL.Query().Get("rule_id")
+	q := r.URL.Query().Get("q")
+	service := r.URL.Query().Get("service")
+	level := r.URL.Query().Get("level")
+
+	alertsList, total, err := a.store.ListAlerts(r.Context(), ruleID, q, service, level, from, to, limit, offset)
 	if err != nil {
 		http.Error(w, "Failed to list alerts", http.StatusInternalServerError)
 		return
@@ -316,5 +320,11 @@ func (a *API) listAlertsHandler(w http.ResponseWriter, r *http.Request) {
 		alertsList = []models.AlertWithContext{}
 	}
 
-	respondJSON(w, http.StatusOK, alertsList)
+	// Wrap the response so the frontend knows the true total!
+	response := map[string]interface{}{
+		"alerts": alertsList,
+		"total":  total,
+	}
+
+	respondJSON(w, http.StatusOK, response)
 }

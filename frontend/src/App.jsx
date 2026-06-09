@@ -6,6 +6,7 @@ import Logs from './pages/Logs';
 import LiveTail from './pages/LiveTail';
 import Dashboard from './pages/Dashboard';
 import Alerts from './pages/Alerts';
+import Rules from './pages/Rules';
 
 // --- Smooth Page Transition Wrapper ---
 const PageTransition = ({ children }) => {
@@ -36,7 +37,8 @@ export default function App() {
   const location = useLocation(); // Hook into the current route
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh' }}>
+    // FIX: Changed minHeight to fixed height and locked overflow
+    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
       <style>{`
         @keyframes fadeInUp {
           to { opacity: 1; transform: translateY(0); }
@@ -48,11 +50,10 @@ export default function App() {
 
       <main style={{ 
         flex: 1, 
-        overflowY: 'scroll', 
+        overflowY: 'auto', // FIX: Main handles its own scrolling now
         position: 'relative',
         zIndex: 10 
       }}>
-        {/* The 'key' forces React to play the animation on every route change */}
         <PageTransition key={location.pathname}>
           <Routes location={location}>
             <Route path="/" element={<Navigate to="/logs" replace />} />
@@ -60,6 +61,7 @@ export default function App() {
             <Route path="/tail" element={<LiveTail />} />
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/alerts" element={<Alerts />} />
+            <Route path="/rules" element={<Rules />} />
           </Routes>
         </PageTransition>
       </main>

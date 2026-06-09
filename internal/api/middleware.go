@@ -140,8 +140,8 @@ func RateLimit(next http.Handler) http.Handler {
 		mu.Lock()
 		v, exists := visitors[ip]
 		if !exists {
-			// Allow 20 requests per second, maximum burst of 50
-			v = &visitor{limiter: rate.NewLimiter(20, 50)}
+			// Allow 100 requests per second, burst of 200 (read-only API only)
+			v = &visitor{limiter: rate.NewLimiter(100, 200)}
 			visitors[ip] = v
 		}
 		v.lastSeen = time.Now()

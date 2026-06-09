@@ -84,7 +84,7 @@ function CustomSelect({ value, onChange, options, placeholder }) {
   );
 }
 
-export default function SearchBar({ onSearch, services = [] }) {
+export default function SearchBar({ onSearch, services = [], searchTime = null, total = 0 }) {
   const [q, setQ] = useState('');
   const [service, setService] = useState('');
   const [level, setLevel] = useState('');
@@ -95,11 +95,17 @@ export default function SearchBar({ onSearch, services = [] }) {
 
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if (e.key === '/' && document.activeElement !== searchInputRef.current) {
-        e.preventDefault();
-        searchInputRef.current?.focus();
+      // If the user presses '/' and isn't already typing in an input field
+      if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+        e.preventDefault(); // Stop the '/' from being typed
+        
+        // Small timeout ensures the browser drops the keystroke before focusing
+        setTimeout(() => {
+          searchInputRef.current?.focus();
+        }, 10);
       }
     };
+    
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
@@ -139,6 +145,21 @@ export default function SearchBar({ onSearch, services = [] }) {
         />
         {q && <X size={18} style={{ cursor: 'pointer', color: 'var(--text-secondary)' }} onClick={() => setQ('')} />}
       </div>
+
+      {/* Search timing — only shown after first result */}
+      {searchTime !== null && (
+        <div style={{
+          fontFamily: 'var(--font-mono)',
+          fontSize: '0.75rem',
+          color: 'var(--text-dim)',
+          paddingLeft: '0.25rem',
+          marginTop: '-0.25rem',
+        }}>
+          <span style={{ color: 'var(--green)', opacity: 0.7 }}>›</span>
+          {' '}{total.toLocaleString()} result{total !== 1 ? 's' : ''}{' '}
+          <span style={{ color: 'var(--text-dim)' }}>in {searchTime}ms</span>
+        </div>
+      )}
       
       <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
         <CustomSelect value={service} onChange={setService} options={serviceOptions} placeholder="All Services" />

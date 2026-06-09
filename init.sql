@@ -1,30 +1,36 @@
 -- init.sql
 
--- 1. Core logs table with native partitioning
+-- 1. Enable Trigram extension for text similarity and ILIKE search performance
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- 2. Core logs table with native partitioning
 CREATE TABLE logs (
     id BIGSERIAL,
     timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     level VARCHAR(10) NOT NULL,
     service VARCHAR(100) NOT NULL,
     message TEXT NOT NULL,
-    metadata JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}'::jsonb,
+    -- search_vector generated automatically based on your live container schema
     search_vector TSVECTOR GENERATED ALWAYS AS (
         to_tsvector('english', service || ' ' || message)
     ) STORED,
     PRIMARY KEY (id, timestamp)
 ) PARTITION BY RANGE (timestamp);
 
--- 2. Create the default partition (Catches everything until specific weekly partitions are made)
+-- 3. Create the default partition (Catches everything until specific weekly partitions are made)
 CREATE TABLE logs_default PARTITION OF logs DEFAULT;
 
--- 3. Indexes for fast retrieval
-CREATE INDEX idx_logs_timestamp ON logs USING BRIN (timestamp);
-CREATE INDEX idx_logs_service   ON logs (service);
-CREATE INDEX idx_logs_level     ON logs (level);
-CREATE INDEX idx_logs_search    ON logs USING GIN (search_vector);
-CREATE INDEX idx_logs_metadata  ON logs USING GIN (metadata);
+-- 4. Indexes for fast retrieval
+-- Note: Creating indexes on the parent table automatically cascades them to all partitions
+CREATE INDEX idx_logs_timestamp    ON logs USING BRIN (timestamp);
+CREATE INDEX idx_logs_service      ON logs USING BTREE (service);
+CREATE INDEX idx_logs_level        ON logs USING BTREE (level);
+CREATE INDEX idx_logs_metadata     ON logs USING GIN (metadata);
+CREATE INDEX idx_logs_search       ON logs USING GIN (search_vector);
+CREATE INDEX idx_logs_message_trgm ON logs USING GIN (message gin_trgm_ops);
 
--- 4. Alert Rules
+-- 5. Alert Rules
 CREATE TABLE alert_rules (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(200) NOT NULL,
@@ -36,7 +42,7 @@ CREATE TABLE alert_rules (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 5. Alert History (Cascades on rule deletion)
+-- 6. Alert History (Cascades on rule deletion)
 CREATE TABLE alerts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     rule_id UUID REFERENCES alert_rules(id) ON DELETE CASCADE,

@@ -10,18 +10,28 @@ import (
 )
 
 type HTTPHandler struct {
-	batcher *Batcher
-	parser  parser.LogParser
+	batcher       *Batcher
+	parser        parser.LogParser
+	ingestEnabled bool
 }
 
-func NewHTTPHandler(b *Batcher, p parser.LogParser) *HTTPHandler {
+func NewHTTPHandler(b *Batcher, p parser.LogParser, ingestEnabled bool) *HTTPHandler {
 	return &HTTPHandler{
-		batcher: b,
-		parser:  p,
+		batcher:       b,
+		parser:        p,
+		ingestEnabled: ingestEnabled,
 	}
 }
 
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// INGEST_ENABLED=false → read-only deployment mode
+	if !h.ingestEnabled {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(`{"error":"ingestion disabled — this is a read-only deployment"}`))
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return

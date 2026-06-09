@@ -27,6 +27,10 @@ services:
       DATABASE_URL: postgres://logstream:password@postgres:5432/logstream?sslmode=disable
       API_KEY: dev-key
       WAL_PATH: /data/wal.log
+      # --- DEPLOYMENT SWITCH ---
+      # Set to "false" before deploying publicly to disable log ingestion.
+      # The search/browse UI will still work, ingestion returns 403.
+      INGEST_ENABLED: "true"
     volumes:
       - data_wal:/data
     depends_on:
