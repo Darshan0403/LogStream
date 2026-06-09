@@ -27,4 +27,4 @@ wal.log
 
 # Environment variables (contains your actual API keys/DB passwords)
 .env
-.env.local
+.env.local.logstream-collector

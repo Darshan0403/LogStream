@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/logstream/internal/models"
@@ -34,6 +35,8 @@ func NewStdinCollector(serverURL, service, apiKey string, logParser parser.LogPa
 }
 
 func (s *StdinCollector) Run(ctx context.Context) {
+	fmt.Printf("[collect:%s] Connected. Reading stdin → %s\n", s.service, s.serverURL)
+
 	scanner := bufio.NewScanner(os.Stdin)
 	// Increase buffer size to 1MB for exceptionally long log lines
 	buf := make([]byte, 1024*1024)
@@ -43,12 +46,18 @@ func (s *StdinCollector) Run(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	linesRead := 0
+	linesParsed := 0
+
 	// Channel to signal a new line was read
 	lines := make(chan string)
 
 	go func() {
 		for scanner.Scan() {
 			lines <- scanner.Text()
+		}
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("[collect:%s] Scanner error: %v\n", s.service, err)
 		}
 		close(lines)
 	}()
@@ -61,25 +70,39 @@ func (s *StdinCollector) Run(ctx context.Context) {
 				if len(batch) > 0 {
 					s.flush(batch)
 				}
+				fmt.Printf("[collect:%s] EOF. Total: %d lines read, %d parsed.\n", s.service, linesRead, linesParsed)
 				return
 			}
 
-			// Try to parse as a batch first (if it's a JSON array string)
-			entries, err := s.parser.ParseBatch([]byte(line))
-			if err != nil {
-				// Fallback to single log parsing
-				entry, err := s.parser.Parse([]byte(line))
-				if err == nil {
-					entries = []models.LogEntry{entry}
-				}
+			linesRead++
+
+			// Skip empty lines
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
 			}
 
-			for _, entry := range entries {
-				if entry.Service == "" {
-					entry.Service = s.service
-				}
-				batch = append(batch, entry)
+			// Parse the single line directly — stdin is always one line at a time.
+			// (ParseBatch was a no-op here because DockerParser.ParseBatch swallows
+			// errors and returns empty slices, making the fallback to Parse dead code.)
+			entry, err := s.parser.Parse([]byte(trimmed))
+			if err != nil {
+				fmt.Printf("[collect:%s] PARSE FAIL: %v | line: %.80s\n", s.service, err, trimmed)
+				continue
 			}
+
+			// Skip entries with empty messages (blank lines that parsed as empty)
+			if entry.Message == "" {
+				continue
+			}
+
+			// Inject service name if the parser didn't set one
+			if entry.Service == "" {
+				entry.Service = s.service
+			}
+
+			linesParsed++
+			batch = append(batch, entry)
 
 			if len(batch) >= 50 {
 				s.flush(batch)
@@ -96,6 +119,7 @@ func (s *StdinCollector) Run(ctx context.Context) {
 			if len(batch) > 0 {
 				s.flush(batch)
 			}
+			fmt.Printf("[collect:%s] Stopped. Total: %d lines read, %d parsed.\n", s.service, linesRead, linesParsed)
 			return
 		}
 	}
@@ -104,12 +128,13 @@ func (s *StdinCollector) Run(ctx context.Context) {
 func (s *StdinCollector) flush(entries []models.LogEntry) {
 	body, err := json.Marshal(entries)
 	if err != nil {
-		fmt.Printf("ERROR - Failed to marshal log batch: %v\n", err)
+		fmt.Printf("[collect:%s] ERROR marshal: %v\n", s.service, err)
 		return
 	}
 
 	req, err := http.NewRequest("POST", s.serverURL+"/ingest", bytes.NewReader(body))
 	if err != nil {
+		fmt.Printf("[collect:%s] ERROR creating request: %v\n", s.service, err)
 		return
 	}
 
@@ -120,12 +145,15 @@ func (s *StdinCollector) flush(entries []models.LogEntry) {
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		fmt.Printf("ERROR - Failed to send logs to %s: %v\n", s.serverURL, err)
+		fmt.Printf("[collect:%s] ERROR sending %d logs to %s: %v\n", s.service, len(entries), s.serverURL, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		fmt.Printf("WARNING - Server rejected logs (Status %d)\n", resp.StatusCode)
+		fmt.Printf("[collect:%s] WARNING server rejected %d logs (Status %d)\n", s.service, len(entries), resp.StatusCode)
+	} else {
+		fmt.Printf("[collect:%s] Flushed %d logs → %s (HTTP %d)\n", s.service, len(entries), s.serverURL, resp.StatusCode)
 	}
 }
+

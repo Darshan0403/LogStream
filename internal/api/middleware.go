@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -98,35 +99,55 @@ func Recoverer(next http.Handler) http.Handler {
 	})
 }
 
-// Global map to hold a rate limiter for every single IP address that visits us
-var visitors = make(map[string]*rate.Limiter)
+// --- BULLETPROOF RATE LIMITER ---
+
+type visitor struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+var (
+	visitors = make(map[string]*visitor)
+	mu       sync.Mutex
+)
+
+// init runs automatically when the package is imported.
+// It starts a background goroutine to clean up stale rate limiters every minute.
+func init() {
+	go func() {
+		for {
+			time.Sleep(time.Minute)
+			mu.Lock()
+			for ip, v := range visitors {
+				// If we haven't seen this IP in 3 minutes, delete it to free memory
+				if time.Since(v.lastSeen) > 3*time.Minute {
+					delete(visitors, ip)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+}
 
 // RateLimit middleware protects endpoints from spam using a token bucket
 func RateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract the IP address (stripping the port)
 		ip := r.RemoteAddr
 		if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
 			ip = ip[:colonIdx]
 		}
 
-		// TRAP 1: Missing sync.Mutex.
-		// If two new IPs hit this exact block of code at the exact same millisecond,
-		// Go will throw a fatal "concurrent map writes" panic and crash the server.
-		//
-		// TRAP 2: Memory Leak.
-		// We are adding IPs to this map forever. We never clean up old IPs.
-		// If this is on the public internet, a botnet scanning ports will fill
-		// our RAM with millions of rate limiters until the server OOM crashes.
-
-		limiter, exists := visitors[ip]
+		mu.Lock()
+		v, exists := visitors[ip]
 		if !exists {
-			// Allow 20 requests per second, with a maximum burst of 50
-			limiter = rate.NewLimiter(20, 50)
-			visitors[ip] = limiter
+			// Allow 20 requests per second, maximum burst of 50
+			v = &visitor{limiter: rate.NewLimiter(20, 50)}
+			visitors[ip] = v
 		}
+		v.lastSeen = time.Now()
+		mu.Unlock()
 
-		if !limiter.Allow() {
+		if !v.limiter.Allow() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			w.Write([]byte(`{"error": "rate limit exceeded - slow down"}`))
