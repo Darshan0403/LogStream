@@ -287,7 +287,17 @@ func (s *Store) DeleteRule(ctx context.Context, id uuid.UUID) error {
 // --- Alert History ---
 
 func (s *Store) CreateAlert(ctx context.Context, ruleID uuid.UUID, logID int64, logTimestamp time.Time) error {
-	query := `INSERT INTO alerts (rule_id, log_id, log_timestamp) VALUES ($1, $2, $3)`
+	// FEATURE G: Alert Deduplication (UPSERT)
+	// If the rule triggers again, overwrite the row with the latest log data
+	// and increment the hit_count to prevent database bloat under DDoS.
+	query := `
+        INSERT INTO alerts (rule_id, log_id, log_timestamp) 
+        VALUES ($1, $2, $3)
+        ON CONFLICT (rule_id) DO UPDATE 
+        SET log_id = EXCLUDED.log_id, 
+            log_timestamp = EXCLUDED.log_timestamp,
+            hit_count = alerts.hit_count + 1`
+
 	_, err := s.pool.Exec(ctx, query, ruleID, logID, logTimestamp)
 	return err
 }

@@ -95,13 +95,13 @@ export default function LiveTail() {
   }, []);
 
   // 2. Bulletproof WebSocket Connection Manager
-  const connectWS = useCallback(() => {
+  // 2. Bulletproof WebSocket Connection Manager (NOW WITH JWT AUTH)
+  const connectWS = useCallback(async () => {
     // Clear any pending reconnects to prevent pile-ups
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
     }
 
-    // FIX 1: Pass 1000 to cleanly close old connections
     if (wsRef.current) {
       wsRef.current.close(1000);
     }
@@ -112,37 +112,51 @@ export default function LiveTail() {
     }
 
     setStatus('connecting');
-    const wsUrl = `${WS_BASE}/ws/tail?key=${API_KEY}&service=${service}&level=${level}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
 
-    ws.onopen = () => setStatus('live');
-    
-    ws.onmessage = (e) => {
-      const batch = JSON.parse(e.data);
-      setLogs(prev => {
-        const newLogs = [...batch, ...prev].slice(0, 500); // Cap at 500 logs in memory
-        return newLogs;
-      });
+    try {
+      // STEP 1: Fetch the short-lived JWT token securely via REST
+      const tokenRes = await apiFetch('/api/ws-token');
+      if (!tokenRes.ok) throw new Error('Failed to retrieve WebSocket token');
+      const data = await tokenRes.json();
+      const jwtToken = data.token;
 
-      if (containerRef.current?.scrollTop > 50) {
-        setMissedLogs(m => m + batch.length);
-      } else if (containerRef.current) {
-        containerRef.current.scrollTop = 0;
-      }
-    };
+      // STEP 2: Connect using the JWT token
+      const wsUrl = `${WS_BASE}/ws/tail?token=${jwtToken}&service=${service}&level=${level}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onerror = () => setStatus('error');
-    
-    ws.onclose = (e) => {
-      // FIX 2: If this event belongs to an old, dead socket, ignore it completely!
-      if (wsRef.current !== ws) return;
+      ws.onopen = () => setStatus('live');
+      
+      ws.onmessage = (e) => {
+        const batch = JSON.parse(e.data);
+        setLogs(prev => {
+          const newLogs = [...batch, ...prev].slice(0, 500); // Cap at 500 logs in memory
+          return newLogs;
+        });
 
-      if (isLive && e.code !== 1000) {
-        setStatus('error');
-        reconnectTimeoutRef.current = setTimeout(connectWS, 3000);
-      }
-    };
+        if (containerRef.current?.scrollTop > 50) {
+          setMissedLogs(m => m + batch.length);
+        } else if (containerRef.current) {
+          containerRef.current.scrollTop = 0;
+        }
+      };
+
+      ws.onerror = () => setStatus('error');
+      
+      ws.onclose = (e) => {
+        if (wsRef.current !== ws) return;
+
+        if (isLive && e.code !== 1000) {
+          setStatus('error');
+          // Wait 3 seconds, then restart the whole JWT fetch + connect process
+          reconnectTimeoutRef.current = setTimeout(connectWS, 3000);
+        }
+      };
+    } catch (err) {
+      console.error("WebSocket Handshake Error:", err);
+      setStatus('error');
+      reconnectTimeoutRef.current = setTimeout(connectWS, 3000);
+    }
   }, [isLive, service, level]);
 
   useEffect(() => {

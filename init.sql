@@ -49,6 +49,7 @@ CREATE TABLE alerts (
     log_id BIGINT,
     log_timestamp TIMESTAMPTZ,
     fired_at TIMESTAMPTZ DEFAULT NOW(),
+    hit_count INT DEFAULT 1,
     -- Foreign key to partitioned table requires matching the partition key
     FOREIGN KEY (log_id, log_timestamp) REFERENCES logs(id, timestamp) ON DELETE CASCADE
 );

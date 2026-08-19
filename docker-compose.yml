@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: logstream
     ports:
-      - "5433:5432"  # FIX: Bound to host port 5433 to avoid collision with AI assistant
+      - "5433:5432"  # Bound to host port 5433 to avoid collision
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -37,15 +37,33 @@ services:
       postgres:
         condition: service_healthy
     command: [ "serve", "--port=8090"]
+    # FEATURE B: Docker Healthcheck calling the new /health endpoint
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   logstream-frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "5173:80"  # FIX: Bound to host port 5173 per design spec
+      - "5173:80"  # Bound to host port 5173 per design spec
     depends_on:
-      - logstream-api
+      # FEATURE B: Nginx waits until the Go API healthcheck passes
+      logstream-api:
+        condition: service_healthy
+
+  vector-agent:
+    image: timberio/vector:0.36.0-alpine
+    volumes:
+      - ./vector_config/vector.yaml:/etc/vector/vector.yaml:ro
+      - ./logs:/var/log/app:ro  # Mounts your Mac's ./logs folder into the agent
+    depends_on:
+      logstream-api:
+        condition: service_healthy
 
 volumes:
   pgdata:

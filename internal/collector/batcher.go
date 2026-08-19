@@ -3,7 +3,11 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
+	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/logstream/internal/alerts"
@@ -12,106 +16,167 @@ import (
 	"github.com/logstream/internal/storage"
 )
 
-// Batcher accumulates log entries from producers (HTTP handlers, stdin reader)
-// and flushes them to the database in batches. A single goroutine drains the
-// channel — Go's channel semantics provide synchronization and backpressure.
+var (
+	ErrBackpressure = errors.New("channel is experiencing backpressure")
+	ErrChannelFull  = errors.New("channel is completely full")
+)
+
 type Batcher struct {
-	ch     chan models.LogEntry
-	store  *storage.Store
-	wal    *WAL
-	engine *alerts.Engine // Alert engine dependency
-	hub    *api.Hub       // NEW: WebSocket Hub dependency
-	done   chan struct{}  // closed when Run() exits after final flush
+	ch      chan models.LogEntry
+	store   *storage.Store
+	wal     *WAL
+	engine  *alerts.Engine
+	hub     *api.Hub
+	done    chan struct{}
+	flushMu sync.Mutex // NEW: Protects the WAL file from concurrent corruption
 }
 
 func NewBatcher(store *storage.Store, wal *WAL, engine *alerts.Engine, hub *api.Hub) *Batcher {
 	return &Batcher{
-		ch:     make(chan models.LogEntry, 10000), // Buffer handles sudden spikes
+		ch:     make(chan models.LogEntry, 10000),
 		store:  store,
 		wal:    wal,
 		engine: engine,
-		hub:    hub, // NEW
+		hub:    hub,
 		done:   make(chan struct{}),
 	}
 }
 
-// Send is called by HTTP handlers to quickly drop a log into the channel.
-// Blocks only if the 10K buffer is full (backpressure).
-func (b *Batcher) Send(entry models.LogEntry) {
-	b.ch <- entry
+func (b *Batcher) Send(entry models.LogEntry) error {
+	capacity := float64(cap(b.ch))
+	current := float64(len(b.ch))
+
+	if current > capacity*0.8 {
+		return ErrBackpressure
+	}
+
+	select {
+	case b.ch <- entry:
+		return nil
+	default:
+		return ErrChannelFull
+	}
 }
 
-// Done returns a channel that is closed when the batcher has finished its
-// final flush and exited. Used by main.go for graceful shutdown sequencing.
 func (b *Batcher) Done() <-chan struct{} {
 	return b.done
 }
 
-// Run executes in a single background goroutine. It drains the channel,
-// accumulates entries, and flushes on: 100 entries, 2s ticker, or context cancel.
+// FEATURE M: The Worker Pool
 func (b *Batcher) Run(ctx context.Context) {
 	defer close(b.done)
 
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	// Dynamically scale workers to the number of available CPU cores
+	numWorkers := runtime.NumCPU()
+	fmt.Printf("Starting Batcher with %d concurrent CPU workers\n", numWorkers)
 
-	var buf []models.LogEntry
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		// Spawn independent concurrent workers
+		go b.resilientWorker(ctx, &wg, i)
+	}
+
+	// Block until all workers finish draining during a graceful shutdown
+	wg.Wait()
+	fmt.Println("All batcher workers shut down gracefully.")
+}
+
+// resilientWorker ensures if one thread panics, the others keep running,
+// and the dead thread is instantly revived.
+func (b *Batcher) resilientWorker(ctx context.Context, wg *sync.WaitGroup, workerID int) {
+	defer wg.Done()
 
 	for {
 		select {
-		case entry := <-b.ch:
-			buf = append(buf, entry)
-			if len(buf) >= 100 {
-				b.flush(ctx, buf)
-				buf = nil
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("CRITICAL: Worker %d panicked, restarting: %v\n%s\n", workerID, r, debug.Stack())
+				}
+			}()
+			b.workerLoop(ctx, workerID)
+		}()
+
+		if ctx.Err() != nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond) // Prevent rapid crash loops
+	}
+}
+
+func (b *Batcher) workerLoop(ctx context.Context, workerID int) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// THE BUCKET: Each worker has its own isolated memory array
+	batch := make([]models.LogEntry, 0, 100)
+
+	for {
+		select {
+		case entry, ok := <-b.ch:
+			if !ok {
+				return // Channel closed
+			}
+			batch = append(batch, entry)
+			if len(batch) >= 100 {
+				b.flush(ctx, batch, workerID)
+				batch = batch[:0]
 			}
 		case <-ticker.C:
-			if len(buf) > 0 {
-				b.flush(ctx, buf)
-				buf = nil
+			if len(batch) > 0 {
+				b.flush(ctx, batch, workerID)
+				batch = batch[:0]
 			}
 		case <-ctx.Done():
-			// Drain any remaining entries from the channel before final flush
+			// Drain logic for this specific worker
 			for {
 				select {
 				case entry := <-b.ch:
-					buf = append(buf, entry)
+					batch = append(batch, entry)
 				default:
 					goto drain_done
 				}
 			}
 		drain_done:
-			if len(buf) > 0 {
-				fmt.Printf("Shutting down: flushing final %d logs...\n", len(buf))
-				b.flush(context.Background(), buf)
+			if len(batch) > 0 {
+				b.flush(context.Background(), batch, workerID)
 			}
-			fmt.Println("Batcher shut down gracefully.")
 			return
 		}
 	}
 }
 
-func (b *Batcher) flush(ctx context.Context, batch []models.LogEntry) {
+func (b *Batcher) flush(ctx context.Context, batch []models.LogEntry, workerID int) {
+	// 1. SERIALIZED DISK WRITES: Only one worker can talk to the flat file/DB at a time
+	b.flushMu.Lock()
+
 	if err := b.wal.Append(batch); err != nil {
 		fmt.Printf("CRITICAL - WAL append error: %v\n", err)
 	}
 
 	if err := b.store.InsertBatch(ctx, batch); err != nil {
 		fmt.Printf("CRITICAL - DB insert error: %v\n", err)
-		return // WAL preserved — will be replayed on next startup
+		b.flushMu.Unlock()
+		return
 	}
 
-	// Only clear the WAL after successful DB insert
 	if err := b.wal.Truncate(); err != nil {
 		fmt.Printf("ERROR - Failed to truncate WAL: %v\n", err)
 	}
 
-	// Check alerts after successful insert (using the IDs returned by Postgres)
+	b.flushMu.Unlock()
+
+	// 2. PARALLEL SIEM EVALUATION: Mutex is unlocked! Workers execute heavy Regex simultaneously
 	if b.engine != nil {
 		b.engine.Check(ctx, batch)
 	}
 
-	// NEW: Broadcast to WebSocket clients
 	if b.hub != nil {
 		b.hub.Broadcast(batch)
 	}
