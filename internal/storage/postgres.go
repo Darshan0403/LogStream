@@ -81,3 +81,11 @@ func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 
 	return nil
 }
+
+// Ping verifies the database connection is alive. Used for health checks.
+func (s *Store) Ping(ctx context.Context) error {
+	if s.pool == nil {
+		return fmt.Errorf("database pool is not initialized")
+	}
+	return s.pool.Ping(ctx)
+}

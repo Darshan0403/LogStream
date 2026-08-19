@@ -104,7 +104,7 @@ func (e *Engine) Check(ctx context.Context, batch []models.LogEntry) {
 			e.lastFired[cr.rule.ID] = now
 			e.cooldownMu.Unlock()
 
-			fmt.Printf("🔔 ALERT [%s]: '%s' matched log #%d from %s\n", cr.rule.Name, cr.rule.Pattern, log.ID, log.Service)
+			fmt.Printf(" ALERT [%s]: '%s' matched log #%d from %s\n", cr.rule.Name, cr.rule.Pattern, log.ID, log.Service)
 			break
 		}
 	}

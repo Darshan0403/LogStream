@@ -1,0 +1,27 @@
+sources:
+  # 1. Tailing the file (The "Pull" mechanism)
+  my_app_logs:
+    type: file
+    include: ["/var/log/app/*.log"]
+    read_from: beginning
+
+transforms:
+  # 2. Vector reads text files line-by-line. This converts the text into JSON.
+  parse:
+    type: remap
+    inputs: ["my_app_logs"]
+    source: |
+      . = parse_json!(.message)
+
+sinks:
+  # 3. Pushing the batch to our Go API
+  logstream_api:
+    type: http
+    inputs: ["parse"]
+    uri: "http://logstream-api:8090/ingest"
+    method: post
+    request:
+      headers:
+        X-API-Key: "dev-key"
+    encoding:
+      codec: json

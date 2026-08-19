@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/logstream/internal/alerts"
 	"github.com/logstream/internal/models"
 	"github.com/logstream/internal/storage"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // API holds the dependencies for the HTTP handlers
@@ -37,8 +39,9 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, 
 	// Public Routes
 	r.Get("/health", api.healthHandler)
 	r.Post("/ingest", ingestHandler.ServeHTTP)
+	r.Handle("/metrics", promhttp.Handler()) // FEATURE L: Exposed Prometheus endpoint
 
-	// NEW: WebSocket Route (Public, validates via query param)
+	// WebSocket Route (Public, but requires valid JWT token via query param)
 	r.Get("/ws/tail", func(w http.ResponseWriter, r *http.Request) {
 		api.hub.ServeWS(w, r, api.apiKey)
 	})
@@ -47,6 +50,9 @@ func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, 
 	r.Route("/api", func(r chi.Router) {
 		r.Use(APIKeyAuth(apiKey))
 		r.Use(RateLimit) // 100 req/sec per IP — protects read endpoints only
+
+		// FEATURE K: JWT Dispenser for frontend WebSocket connections
+		r.Get("/ws-token", api.wsTokenHandler)
 
 		r.Get("/logs", api.searchHandler)
 		r.Get("/logs/{id}", api.getLogHandler)
@@ -72,7 +78,32 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func (a *API) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.Ping(r.Context()); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		respondJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "degraded",
+			"error":  "database unreachable",
+		})
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "logstream"})
+}
+
+// wsTokenHandler generates a short-lived JWT for the React UI to use when opening the WebSocket
+func (a *API) wsTokenHandler(w http.ResponseWriter, r *http.Request) {
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"exp": time.Now().Add(60 * time.Second).Unix(), // Strict 60-second validity
+		"iat": time.Now().Unix(),
+	})
+
+	// We use the server's API key as the cryptographic secret to sign the JWT
+	signed, err := token.SignedString([]byte(a.apiKey))
+	if err != nil {
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"token": signed})
 }
 
 func (a *API) searchHandler(w http.ResponseWriter, r *http.Request) {

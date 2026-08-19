@@ -7,8 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/logstream/internal/models"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -25,6 +27,16 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
+}
+
+// FEATURE L: Prometheus Metrics for WebSocket Connections
+var ActiveWSClients = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "logstream_active_websocket_clients",
+	Help: "Number of active WebSocket connections streaming logs",
+})
+
+func init() {
+	prometheus.MustRegister(ActiveWSClients)
 }
 
 // Client is a middleman between the websocket connection and the hub.
@@ -63,12 +75,14 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
+			ActiveWSClients.Inc() // Increment Prometheus metric
 			log.Println("WebSocket client registered. Active clients:", len(h.clients))
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
+				ActiveWSClients.Dec() // Decrement Prometheus metric
 				log.Println("WebSocket client unregistered. Active clients:", len(h.clients))
 			}
 			h.mu.Unlock()
@@ -146,9 +160,6 @@ func (c *Client) writePump() {
 }
 
 // readPump pumps messages from the websocket connection to the hub.
-// The application runs readPump in a per-connection goroutine. The application
-// ensures that there is at most one reader on a connection by executing all
-// reads from this goroutine.
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -169,11 +180,20 @@ func (c *Client) readPump() {
 }
 
 // ServeWS handles websocket requests from the peer.
-func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, apiKey string) {
-	// Validate API Key passed as query parameter
-	key := r.URL.Query().Get("key")
-	if key != apiKey {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, jwtSecret string) {
+	// FEATURE K: Secure JWT Validation for WebSocket Upgrades
+	tokenStr := r.URL.Query().Get("token")
+	if tokenStr == "" {
+		http.Error(w, "Missing JWT token", http.StatusUnauthorized)
+		return
+	}
+
+	_, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		return []byte(jwtSecret), nil
+	})
+
+	if err != nil {
+		http.Error(w, "Unauthorized - Invalid or Expired Token", http.StatusUnauthorized)
 		return
 	}
 
