@@ -13,29 +13,33 @@ import (
 	"github.com/logstream/internal/models"
 )
 
+// likeMetaReplacer backslash-escapes the three LIKE metacharacters so user input
+// can never widen or defeat the match (M3).
+var likeMetaReplacer = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// likePattern turns a user query into a safe ILIKE pattern: escape metacharacters
+// first, then map spaces to wildcards so "connection refused" still matches
+// "connection  refused" (syslog double-spacing).
+func likePattern(q string) string {
+	return "%" + strings.ReplaceAll(likeMetaReplacer.Replace(q), " ", "%") + "%"
+}
+
 // Search performs full-text search and filtering across the logs table.
 // Uses the Trigram GIN index on the message column (via ILIKE) for blazing fast partial matches.
 // A single query with COUNT(*) OVER() avoids scanning twice.
+//
+// Callers should pass a bounded [from,to] window; the API layer supplies a
+// default lower bound so an unfiltered query cannot scan the whole table (M2).
 func (s *Store) Search(ctx context.Context, q, service, level string, from, to time.Time, limit, offset int) ([]models.LogEntry, int64, error) {
 	var whereClauses []string
 	var args []any
 	argPos := 1
 
 	// Use ILIKE because our custom pg_trgm GIN index makes this lightning fast
-	// without breaking on technical strings like "NullPointerException" or "B-199"
-	// Inside Search() and ListAlerts() functions
-
+	// without breaking on technical strings like "NullPointerException" or "B-199".
 	if q != "" {
-		// FIX: Replace literal spaces with wildcards to ignore syslog double-spacing
-		fuzzyQ := strings.ReplaceAll(q, " ", "%")
-
-		// For Search():
-		whereClauses = append(whereClauses, fmt.Sprintf("message ILIKE $%d", argPos))
-
-		// OR for ListAlerts() use the table alias 'l.':
-		// whereClauses = append(whereClauses, fmt.Sprintf("l.message ILIKE $%d", argPos))
-
-		args = append(args, "%"+fuzzyQ+"%")
+		whereClauses = append(whereClauses, fmt.Sprintf(`message ILIKE $%d ESCAPE '\'`, argPos))
+		args = append(args, likePattern(q))
 		argPos++
 	}
 	if service != "" {
@@ -102,12 +106,19 @@ func (s *Store) Search(ctx context.Context, q, service, level string, from, to t
 	return logs, totalCount, nil
 }
 
-// GetLog returns a single target log record matching the explicit ID
-func (s *Store) GetLog(ctx context.Context, id int64) (*models.LogEntry, error) {
+// GetLog returns a single log record by ID. When tsHint is non-zero it is used
+// as a ±1 day bound on the partition key so Postgres can prune to a single
+// weekly partition instead of scanning them all (M2).
+func (s *Store) GetLog(ctx context.Context, id int64, tsHint time.Time) (*models.LogEntry, error) {
 	var entry models.LogEntry
 	query := "SELECT id, timestamp, level, service, message, metadata FROM logs WHERE id = $1"
+	args := []any{id}
+	if !tsHint.IsZero() {
+		query += " AND timestamp >= $2::timestamptz - interval '1 day' AND timestamp < $2::timestamptz + interval '1 day'"
+		args = append(args, tsHint)
+	}
 
-	err := s.pool.QueryRow(ctx, query, id).Scan(
+	err := s.pool.QueryRow(ctx, query, args...).Scan(
 		&entry.ID, &entry.Timestamp, &entry.Level, &entry.Service, &entry.Message, &entry.Metadata,
 	)
 	if err != nil {
@@ -230,6 +241,13 @@ func (s *Store) ListRules(ctx context.Context) ([]models.AlertRule, error) {
 	return rules, nil
 }
 
+// CountRules returns the total number of alert rules (used to cap rule creation, M5).
+func (s *Store) CountRules(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM alert_rules").Scan(&n)
+	return n, err
+}
+
 func (s *Store) GetRule(ctx context.Context, id uuid.UUID) (*models.AlertRule, error) {
 	query := `SELECT id, name, pattern, level_filter, service_filter, cooldown_minutes, is_active, created_at 
 			  FROM alert_rules WHERE id = $1`
@@ -313,10 +331,8 @@ func (s *Store) ListAlerts(ctx context.Context, ruleID, q, service, level string
 		argPos++
 	}
 	if q != "" {
-		// Space-fuzzy matching for the alerts search bar too!
-		fuzzyQ := strings.ReplaceAll(q, " ", "%")
-		whereClauses = append(whereClauses, fmt.Sprintf("l.message ILIKE $%d", argPos))
-		args = append(args, "%"+fuzzyQ+"%")
+		whereClauses = append(whereClauses, fmt.Sprintf(`l.message ILIKE $%d ESCAPE '\'`, argPos))
+		args = append(args, likePattern(q))
 		argPos++
 	}
 	if service != "" {

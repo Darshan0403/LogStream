@@ -11,14 +11,16 @@ CREATE TABLE logs (
     service VARCHAR(100) NOT NULL,
     message TEXT NOT NULL,
     metadata JSONB DEFAULT '{}'::jsonb,
-    -- search_vector generated automatically based on your live container schema
-    search_vector TSVECTOR GENERATED ALWAYS AS (
-        to_tsvector('english', service || ' ' || message)
-    ) STORED,
     PRIMARY KEY (id, timestamp)
 ) PARTITION BY RANGE (timestamp);
+-- Note: search is trigram/ILIKE on `message` (idx_logs_message_trgm). A previous
+-- tsvector generated column was dropped — it only added write amplification.
+-- Existing databases: ALTER TABLE logs DROP COLUMN IF EXISTS search_vector;
 
--- 3. Create the default partition (Catches everything until specific weekly partitions are made)
+-- 3. Default partition — catch-all for timestamps outside any weekly partition.
+-- The application provisions rolling weekly partitions at startup and every 6h
+-- (storage.EnsurePartitions), so on a normal deployment new rows land in a
+-- weekly partition and this stays empty.
 CREATE TABLE logs_default PARTITION OF logs DEFAULT;
 
 -- 4. Indexes for fast retrieval
@@ -27,7 +29,6 @@ CREATE INDEX idx_logs_timestamp    ON logs USING BRIN (timestamp);
 CREATE INDEX idx_logs_service      ON logs USING BTREE (service);
 CREATE INDEX idx_logs_level        ON logs USING BTREE (level);
 CREATE INDEX idx_logs_metadata     ON logs USING GIN (metadata);
-CREATE INDEX idx_logs_search       ON logs USING GIN (search_vector);
 CREATE INDEX idx_logs_message_trgm ON logs USING GIN (message gin_trgm_ops);
 
 -- 5. Alert Rules
@@ -53,3 +54,8 @@ CREATE TABLE alerts (
     -- Foreign key to partitioned table requires matching the partition key
     FOREIGN KEY (log_id, log_timestamp) REFERENCES logs(id, timestamp) ON DELETE CASCADE
 );
+
+-- 7. One alert row per rule (deduplication).
+-- Required by CreateAlert's `INSERT ... ON CONFLICT (rule_id) DO UPDATE`, which
+-- errors without a unique index/constraint on the conflict target.
+CREATE UNIQUE INDEX idx_alerts_rule_id ON alerts (rule_id);

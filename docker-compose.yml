@@ -1,16 +1,15 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: logstream
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
       POSTGRES_DB: logstream
     ports:
       - "5433:5432"  # Bound to host port 5433 to avoid collision
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U logstream"]
       interval: 5s
@@ -24,13 +23,28 @@ services:
     ports:
       - "8090:8090"  # Facing host port 8090
     environment:
-      DATABASE_URL: postgres://logstream:password@postgres:5432/logstream?sslmode=disable
-      API_KEY: dev-key
+      DATABASE_URL: postgres://logstream:${POSTGRES_PASSWORD}@postgres:5432/logstream?sslmode=disable
+      # Dashboard/read API key. Required — the server refuses to start on 'dev-key'.
+      API_KEY: ${API_KEY:?set API_KEY in .env (see .env.example)}
+      # Optional: separate credential for log shippers. Defaults to API_KEY.
+      INGEST_KEY: ${INGEST_KEY:-}
       WAL_PATH: /data/wal.log
+      # Browser origin(s) allowed to call the API / open the live-tail socket (H6).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      # CIDRs whose X-Forwarded-For is trusted (H2). Default already covers the
+      # Docker bridge network; override if you front this with another proxy.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Optional dedicated WebSocket JWT secret (H1). Derived from API_KEY if unset.
+      WS_JWT_SECRET: ${WS_JWT_SECRET:-}
+      # Structured logging (L5): LOG_FORMAT=json|text, LOG_LEVEL=debug|info|warn|error
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
       # --- DEPLOYMENT SWITCH ---
       # Set to "false" before deploying publicly to disable log ingestion.
       # The search/browse UI will still work, ingestion returns 403.
       INGEST_ENABLED: "true"
+      # Set to "true" ONLY for throwaway local dev to allow default secrets.
+      ALLOW_INSECURE_DEFAULTS: ${ALLOW_INSECURE_DEFAULTS:-false}
     volumes:
       - data_wal:/data
     depends_on:
@@ -51,6 +65,10 @@ services:
       dockerfile: Dockerfile
     ports:
       - "5173:80"  # Bound to host port 5173 per design spec
+    environment:
+      # Injected into proxied /api and /ws requests by nginx so the key is
+      # never shipped in the browser bundle.
+      LOGSTREAM_API_KEY: ${API_KEY}
     depends_on:
       # FEATURE B: Nginx waits until the Go API healthcheck passes
       logstream-api:
@@ -58,6 +76,8 @@ services:
 
   vector-agent:
     image: timberio/vector:0.36.0-alpine
+    environment:
+      LOGSTREAM_API_KEY: ${INGEST_KEY:-${API_KEY}}
     volumes:
       - ./vector_config/vector.yaml:/etc/vector/vector.yaml:ro
       - ./logs:/var/log/app:ro  # Mounts your Mac's ./logs folder into the agent

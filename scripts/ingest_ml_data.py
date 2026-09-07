@@ -6,7 +6,7 @@ import re
 
 # Configuration
 LOGSTREAM_URL = "http://localhost:8090/ingest"
-API_KEY = "dev-key"  # Change this if you updated your docker-compose!
+API_KEY = os.environ.get("INGEST_KEY") or os.environ["API_KEY"]  # export before running
 BATCH_SIZE = 100
 
 # Regex for extracting juicy metadata

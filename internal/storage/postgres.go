@@ -46,39 +46,49 @@ func (s *Store) Close() {
 	}
 }
 
-// InsertBatch writes multiple logs in a single network round-trip.
-// Uses RETURNING id to populate the slice for the Alert Engine.
+// InsertBatch writes multiple logs in a single transaction and populates each
+// entry's ID from RETURNING. All-or-nothing: a failure part-way through rolls
+// the whole batch back, so a retained WAL segment replays cleanly with no
+// partially-committed duplicates (M8).
 func (s *Store) InsertBatch(ctx context.Context, logs []models.LogEntry) error {
 	if len(logs) == 0 {
 		return nil
 	}
 
-	batch := &pgx.Batch{}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin insert tx: %w", err)
+	}
+	defer tx.Rollback(ctx) // no-op once committed
 
-	// FIX: Added RETURNING id to the query
-	query := `
-		INSERT INTO logs (timestamp, level, service, message, metadata) 
+	const query = `
+		INSERT INTO logs (timestamp, level, service, message, metadata)
 		VALUES ($1, $2, $3, $4, $5) RETURNING id`
 
+	batch := &pgx.Batch{}
+	now := time.Now()
 	for _, log := range logs {
-		if log.Timestamp.IsZero() {
-			log.Timestamp = time.Now()
+		ts := log.Timestamp
+		if ts.IsZero() {
+			ts = now
 		}
-		batch.Queue(query, log.Timestamp, log.Level, log.Service, log.Message, log.Metadata)
+		batch.Queue(query, ts, log.Level, log.Service, log.Message, log.Metadata)
 	}
 
-	br := s.pool.SendBatch(ctx, batch)
-	// Safe to defer Close here; it cleans up if we error out early
-	defer br.Close()
-
-	for i := 0; i < len(logs); i++ {
-		// FIX: Replaced Exec() with QueryRow().Scan() to capture the generated ID
-		err := br.QueryRow().Scan(&logs[i].ID)
-		if err != nil {
+	br := tx.SendBatch(ctx, batch)
+	for i := range logs {
+		if err := br.QueryRow().Scan(&logs[i].ID); err != nil {
+			br.Close()
 			return fmt.Errorf("failed inserting log at index %d: %w", i, err)
 		}
 	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("closing insert batch: %w", err)
+	}
 
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit insert tx: %w", err)
+	}
 	return nil
 }
 

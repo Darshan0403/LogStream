@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -41,6 +42,15 @@ func main() {
 		},
 	}
 
+	apiKey := os.Getenv("INGEST_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("API_KEY")
+	}
+	if apiKey == "" {
+		fmt.Println("Set API_KEY (or INGEST_KEY) before running the load test.")
+		os.Exit(1)
+	}
+
 	start := time.Now()
 
 	var successCount, failCount int
@@ -55,7 +65,7 @@ func main() {
 				payload := fmt.Sprintf(payloadTemplate, i, i, i, i, i)
 				req, _ := http.NewRequest("POST", "http://localhost:8090/ingest", bytes.NewBuffer([]byte(payload)))
 				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("X-API-Key", "dev-key")
+				req.Header.Set("X-API-Key", apiKey)
 
 				resp, err := client.Do(req)
 

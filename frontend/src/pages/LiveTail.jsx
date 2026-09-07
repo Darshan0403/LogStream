@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, Pause, Activity, ArrowUp, ChevronDown } from 'lucide-react';
 import { format } from 'date-fns';
-import { WS_BASE, API_KEY, apiFetch } from '../config/api';
+import { WS_BASE, apiFetch } from '../config/api';
 
 // --- Reusable Sleek Dropdown ---
 function CustomSelect({ value, onChange, options, placeholder }) {
@@ -120,9 +120,14 @@ export default function LiveTail() {
       const data = await tokenRes.json();
       const jwtToken = data.token;
 
-      // STEP 2: Connect using the JWT token
-      const wsUrl = `${WS_BASE}/ws/tail?token=${jwtToken}&service=${service}&level=${level}`;
-      const ws = new WebSocket(wsUrl);
+      // STEP 2: Connect. The JWT rides in the Sec-WebSocket-Protocol header
+      // (via the subprotocol list) so it never appears in a URL or proxy log.
+      const params = new URLSearchParams();
+      if (service) params.set('service', service);
+      if (level) params.set('level', level);
+      const qs = params.toString();
+      const wsUrl = `${WS_BASE}/ws/tail${qs ? `?${qs}` : ''}`;
+      const ws = new WebSocket(wsUrl, ['logstream', `auth.${jwtToken}`]);
       wsRef.current = ws;
 
       ws.onopen = () => setStatus('live');

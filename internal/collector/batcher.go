@@ -4,7 +4,7 @@ package collector
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log/slog"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -22,13 +22,12 @@ var (
 )
 
 type Batcher struct {
-	ch      chan models.LogEntry
-	store   *storage.Store
-	wal     *WAL
-	engine  *alerts.Engine
-	hub     *api.Hub
-	done    chan struct{}
-	flushMu sync.Mutex // NEW: Protects the WAL file from concurrent corruption
+	ch     chan models.LogEntry
+	store  *storage.Store
+	wal    *WAL
+	engine *alerts.Engine
+	hub    *api.Hub
+	done   chan struct{}
 }
 
 func NewBatcher(store *storage.Store, wal *WAL, engine *alerts.Engine, hub *api.Hub) *Batcher {
@@ -68,7 +67,7 @@ func (b *Batcher) Run(ctx context.Context) {
 
 	// Dynamically scale workers to the number of available CPU cores
 	numWorkers := runtime.NumCPU()
-	fmt.Printf("Starting Batcher with %d concurrent CPU workers\n", numWorkers)
+	slog.Info("batcher starting", slog.Int("workers", numWorkers))
 
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -79,7 +78,7 @@ func (b *Batcher) Run(ctx context.Context) {
 
 	// Block until all workers finish draining during a graceful shutdown
 	wg.Wait()
-	fmt.Println("All batcher workers shut down gracefully.")
+	slog.Info("batcher workers shut down")
 }
 
 // resilientWorker ensures if one thread panics, the others keep running,
@@ -97,7 +96,7 @@ func (b *Batcher) resilientWorker(ctx context.Context, wg *sync.WaitGroup, worke
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Printf("CRITICAL: Worker %d panicked, restarting: %v\n%s\n", workerID, r, debug.Stack())
+					slog.Error("batcher worker panicked, restarting", slog.Int("worker", workerID), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
 				}
 			}()
 			b.workerLoop(ctx, workerID)
@@ -126,12 +125,12 @@ func (b *Batcher) workerLoop(ctx context.Context, workerID int) {
 			batch = append(batch, entry)
 			if len(batch) >= 100 {
 				b.flush(ctx, batch, workerID)
-				batch = batch[:0]
+				batch = nil // fresh backing array; old one is owned by flush/hub now
 			}
 		case <-ticker.C:
 			if len(batch) > 0 {
 				b.flush(ctx, batch, workerID)
-				batch = batch[:0]
+				batch = nil // fresh backing array; old one is owned by flush/hub now
 			}
 		case <-ctx.Done():
 			// Drain logic for this specific worker
@@ -152,31 +151,32 @@ func (b *Batcher) workerLoop(ctx context.Context, workerID int) {
 	}
 }
 
+// flush persists one batch. Each batch gets its own WAL segment, so workers no
+// longer need a shared lock and a failed insert leaves exactly that batch on
+// disk for recovery without any other flush being able to delete it (H4).
+//
+// The caller must not reuse the backing array of batch after calling flush —
+// the slice is handed to the WebSocket hub asynchronously.
 func (b *Batcher) flush(ctx context.Context, batch []models.LogEntry, workerID int) {
-	// 1. SERIALIZED DISK WRITES: Only one worker can talk to the flat file/DB at a time
-	b.flushMu.Lock()
-
-	if err := b.wal.Append(batch); err != nil {
-		fmt.Printf("CRITICAL - WAL append error: %v\n", err)
+	seg, err := b.wal.AppendSegment(batch)
+	if err != nil {
+		slog.Error("WAL append failed", slog.Int("worker", workerID), slog.Any("err", err))
 	}
 
 	if err := b.store.InsertBatch(ctx, batch); err != nil {
-		fmt.Printf("CRITICAL - DB insert error: %v\n", err)
-		b.flushMu.Unlock()
+		// Segment is intentionally retained; it will be replayed on next start.
+		slog.Error("DB insert failed; WAL segment retained", slog.Int("worker", workerID), slog.String("segment", seg), slog.Any("err", err))
 		return
 	}
 
-	if err := b.wal.Truncate(); err != nil {
-		fmt.Printf("ERROR - Failed to truncate WAL: %v\n", err)
+	if err := b.wal.RemoveSegment(seg); err != nil {
+		slog.Error("failed to remove committed WAL segment", slog.String("segment", seg), slog.Any("err", err))
 	}
 
-	b.flushMu.Unlock()
-
-	// 2. PARALLEL SIEM EVALUATION: Mutex is unlocked! Workers execute heavy Regex simultaneously
+	// SIEM evaluation + live tail. Broadcast is non-blocking (H3).
 	if b.engine != nil {
 		b.engine.Check(ctx, batch)
 	}
-
 	if b.hub != nil {
 		b.hub.Broadcast(batch)
 	}

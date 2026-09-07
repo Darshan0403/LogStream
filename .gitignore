@@ -9,6 +9,14 @@
 # Logstream Ingestion Dev Artifacts
 wal.log
 *.log
+# Segmented WAL directories (WAL_PATH basename + ".wal.d")
+*.wal.d/
+# Built collector binary produced by scripts/dogfood.sh
+.logstream-collector
+
+# Local log directory mounted into the vector-agent container (keep the dir, ignore contents)
+/logs/*
+!/logs/.gitkeep
 
 # Dependency directories
 /vendor/
@@ -27,4 +35,5 @@ wal.log
 
 # Environment variables (contains your actual API keys/DB passwords)
 .env
-.env.local.logstream-collector
+.env.local
+.env.*.local

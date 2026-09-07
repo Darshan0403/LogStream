@@ -3,7 +3,7 @@
 # Usage: ./scripts/dogfood.sh
 
 LOGSTREAM_URL="http://localhost:8090"
-API_KEY="dev-key"
+API_KEY="${INGEST_KEY:-${API_KEY:?export API_KEY (or INGEST_KEY) before running}}"
 LOGSTREAM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "=== LogStream Dogfooding Pipeline ==="
