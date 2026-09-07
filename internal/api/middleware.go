@@ -3,14 +3,17 @@ package api
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/logstream/internal/logging"
 	"golang.org/x/time/rate"
 )
 
@@ -56,7 +59,22 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
-// Logger logs the method, path, status code, and execution duration
+// RequestID assigns each request a correlation id, exposes it on the response as
+// X-Request-ID, and stashes it in the context so downstream logs can include it (L5).
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get("X-Request-ID")
+		if id == "" {
+			var b [8]byte
+			_, _ = rand.Read(b[:])
+			id = hex.EncodeToString(b[:])
+		}
+		w.Header().Set("X-Request-ID", id)
+		next.ServeHTTP(w, r.WithContext(logging.WithRequestID(r.Context(), id)))
+	})
+}
+
+// Logger emits one structured line per request (L5).
 func Logger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -64,24 +82,37 @@ func Logger(next http.Handler) http.Handler {
 
 		next.ServeHTTP(rec, r)
 
-		fmt.Printf("%s %s → %d (%v)\n", r.Method, r.URL.Path, rec.status, time.Since(start))
+		slog.LogAttrs(r.Context(), slog.LevelInfo, "http request",
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", rec.status),
+			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
+		)
 	})
 }
 
-// CORS handles Cross-Origin Resource Sharing and preflight OPTIONS requests
-func CORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "X-API-Key, Content-Type")
+// CORS echoes the request Origin only when it is on the allowlist or matches the
+// request host (same-origin behind a proxy). Unknown origins get no CORS headers,
+// so the browser blocks the cross-origin read (H6).
+func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+			if origin != "" && (originAllowed(origin, allowedOrigins) || sameHostOrigin(origin, r.Host)) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Add("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "X-API-Key, Content-Type, X-Idempotency-Key")
+			}
 
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
 
-		next.ServeHTTP(w, r)
-	})
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // Recoverer catches panics, logs the stack trace, and safely returns a 500 error
@@ -89,7 +120,8 @@ func Recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				fmt.Printf("CRITICAL PANIC: %v\n%s\n", err, debug.Stack())
+				slog.ErrorContext(r.Context(), "panic recovered in handler",
+					slog.Any("panic", err), slog.String("stack", string(debug.Stack())))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
 				w.Write([]byte(`{"error": "internal server error"}`))
@@ -129,13 +161,18 @@ func init() {
 	}()
 }
 
-// RateLimit middleware protects endpoints from spam using a token bucket
-func RateLimit(next http.Handler) http.Handler {
+// RateLimit middleware protects endpoints from spam using a per-client token
+// bucket. The client is resolved via X-Forwarded-For when the peer is a trusted
+// proxy, so limits are per real client rather than per proxy IP (H2).
+func RateLimit(trustedProxies []*net.IPNet) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return rateLimitHandler(next, trustedProxies)
+	}
+}
+
+func rateLimitHandler(next http.Handler, trustedProxies []*net.IPNet) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
-		if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
-			ip = ip[:colonIdx]
-		}
+		ip := clientIP(r.RemoteAddr, r.Header.Get("X-Forwarded-For"), trustedProxies)
 
 		mu.Lock()
 		v, exists := visitors[ip]

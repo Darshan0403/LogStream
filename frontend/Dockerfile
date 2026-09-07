@@ -4,11 +4,14 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY . .
-# Bake the localhost URLs into the static build for local Docker testing
-RUN VITE_API_URL=http://localhost:8090 VITE_WS_URL=ws://localhost:8090 npm run build
+# Build same-origin: the frontend talks to nginx, which proxies /api and /ws to
+# the Go server and injects the API key. No URLs or secrets are baked in.
+RUN npm run build
 
 # Stage 2: Serve
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Rendered to /etc/nginx/conf.d/default.conf at container start with envsubst,
+# substituting ${LOGSTREAM_API_KEY} from the environment.
+COPY default.conf.template /etc/nginx/templates/default.conf.template
 EXPOSE 80

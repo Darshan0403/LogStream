@@ -22,6 +22,6 @@ sinks:
     method: post
     request:
       headers:
-        X-API-Key: "dev-key"
+        X-API-Key: "${LOGSTREAM_API_KEY}"
     encoding:
       codec: json

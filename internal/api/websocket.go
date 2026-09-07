@@ -2,9 +2,10 @@
 package api
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
-	"sync"
+	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -18,25 +19,25 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 512
+
+	clientSendBuffer = 256
+	hubBroadcastBuf  = 512
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// In production, you would restrict this to specific origins
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
-
 // FEATURE L: Prometheus Metrics for WebSocket Connections
-var ActiveWSClients = prometheus.NewGauge(prometheus.GaugeOpts{
-	Name: "logstream_active_websocket_clients",
-	Help: "Number of active WebSocket connections streaming logs",
-})
+var (
+	ActiveWSClients = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "logstream_active_websocket_clients",
+		Help: "Number of active WebSocket connections streaming logs",
+	})
+	WSDroppedBatches = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "logstream_websocket_dropped_batches_total",
+		Help: "Log batches dropped because a client or the hub could not keep up",
+	})
+)
 
 func init() {
-	prometheus.MustRegister(ActiveWSClients)
+	prometheus.MustRegister(ActiveWSClients, WSDroppedBatches)
 }
 
 // Client is a middleman between the websocket connection and the hub.
@@ -48,83 +49,105 @@ type Client struct {
 	levelFilter   string                 // Filter logs by level (optional)
 }
 
-// Hub maintains the set of active clients and broadcasts messages to the clients.
+// Hub maintains the set of active clients and broadcasts messages to them.
+//
+// The clients map is owned exclusively by the Run goroutine: registration,
+// unregistration and fan-out all happen there, so no mutex is needed and a slow
+// client can never block a producer (H3). Producers hand batches to Run through
+// the buffered broadcast channel and never touch client channels directly.
 type Hub struct {
-	clients    map[*Client]bool
-	mu         sync.RWMutex
-	broadcast  chan []models.LogEntry
-	register   chan *Client
-	unregister chan *Client
+	clients        map[*Client]bool
+	broadcast      chan []models.LogEntry
+	register       chan *Client
+	unregister     chan *Client
+	allowedOrigins []string
+	jwtSecret      []byte
 }
 
 // NewHub creates a new Hub instance.
-func NewHub() *Hub {
+func NewHub(jwtSecret []byte, allowedOrigins []string) *Hub {
 	return &Hub{
-		broadcast:  make(chan []models.LogEntry),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		clients:    make(map[*Client]bool),
+		broadcast:      make(chan []models.LogEntry, hubBroadcastBuf),
+		register:       make(chan *Client),
+		unregister:     make(chan *Client),
+		clients:        make(map[*Client]bool),
+		allowedOrigins: allowedOrigins,
+		jwtSecret:      jwtSecret,
 	}
 }
 
-// Run starts the hub's main loop to handle client registration and unregistration.
+// Run starts the hub's main loop. It self-restarts on panic (H5).
 func (h *Hub) Run() {
+	for {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("hub: recovered from panic, restarting loop", slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+				}
+			}()
+			h.loop()
+		}()
+	}
+}
+
+func (h *Hub) loop() {
 	for {
 		select {
 		case client := <-h.register:
-			h.mu.Lock()
 			h.clients[client] = true
-			h.mu.Unlock()
-			ActiveWSClients.Inc() // Increment Prometheus metric
-			log.Println("WebSocket client registered. Active clients:", len(h.clients))
+			ActiveWSClients.Inc()
+			slog.Info("websocket client registered", slog.Int("active", len(h.clients)))
 		case client := <-h.unregister:
-			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
-				ActiveWSClients.Dec() // Decrement Prometheus metric
-				log.Println("WebSocket client unregistered. Active clients:", len(h.clients))
+				ActiveWSClients.Dec()
+				slog.Info("websocket client unregistered", slog.Int("active", len(h.clients)))
 			}
-			h.mu.Unlock()
+		case batch := <-h.broadcast:
+			h.fanout(batch)
 		}
 	}
 }
 
-// Broadcast sends a batch of logs to all connected, filtered clients.
+// fanout runs on the Run goroutine only.
+func (h *Hub) fanout(batch []models.LogEntry) {
+	for client := range h.clients {
+		filtered := batch
+		if client.serviceFilter != "" || client.levelFilter != "" {
+			filtered = filtered[:0:0]
+			for _, e := range batch {
+				if client.serviceFilter != "" && client.serviceFilter != e.Service {
+					continue
+				}
+				if client.levelFilter != "" && client.levelFilter != e.Level {
+					continue
+				}
+				filtered = append(filtered, e)
+			}
+		}
+		if len(filtered) == 0 {
+			continue
+		}
+		// Strictly non-blocking: a client that cannot keep up drops this batch.
+		select {
+		case client.send <- filtered:
+		default:
+			WSDroppedBatches.Inc()
+		}
+	}
+}
+
+// Broadcast is called by producers (the batcher). Non-blocking: if the hub is
+// backed up the batch is dropped rather than stalling ingestion (H3).
 func (h *Hub) Broadcast(batch []models.LogEntry) {
 	if len(batch) == 0 {
 		return
 	}
-
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	for client := range h.clients {
-		// Filter the batch for this specific client
-		var filtered []models.LogEntry
-		for _, logEntry := range batch {
-			if client.serviceFilter != "" && client.serviceFilter != logEntry.Service {
-				continue
-			}
-			if client.levelFilter != "" && client.levelFilter != logEntry.Level {
-				continue
-			}
-			filtered = append(filtered, logEntry)
-		}
-
-		if len(filtered) > 0 {
-			// Non-blocking send. If the client buffer is full, drop the oldest message.
-			select {
-			case client.send <- filtered:
-			default:
-				log.Println("Warning: Slow client detected, dropping oldest batch")
-				select {
-				case <-client.send: // drain one old message
-				default:
-				}
-				client.send <- filtered
-			}
-		}
+	select {
+	case h.broadcast <- batch:
+	default:
+		WSDroppedBatches.Inc()
 	}
 }
 
@@ -135,6 +158,7 @@ func (c *Client) writePump() {
 		ticker.Stop()
 		c.conn.Close()
 	}()
+	defer recoverLog("writePump")
 
 	for {
 		select {
@@ -165,6 +189,8 @@ func (c *Client) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
+	defer recoverLog("readPump")
+
 	c.conn.SetReadLimit(maxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
@@ -172,41 +198,86 @@ func (c *Client) readPump() {
 		_, _, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				slog.Warn("websocket read error", slog.Any("err", err))
 			}
 			break
 		}
 	}
 }
 
+// bearerFromProtocols extracts a JWT from a Sec-WebSocket-Protocol header value.
+// The browser sends e.g. "logstream, auth.<jwt>"; we return the "<jwt>" part.
+func bearerFromProtocols(header string) string {
+	for _, p := range strings.Split(header, ",") {
+		p = strings.TrimSpace(p)
+		if after, ok := strings.CutPrefix(p, "auth."); ok {
+			return after
+		}
+	}
+	return ""
+}
+
+// recoverLog swallows and logs a panic in a long-lived goroutine (H5).
+func recoverLog(where string) {
+	if r := recover(); r != nil {
+		slog.Error("websocket goroutine recovered from panic", slog.String("where", where), slog.Any("panic", r), slog.String("stack", string(debug.Stack())))
+	}
+}
+
 // ServeWS handles websocket requests from the peer.
-func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request, jwtSecret string) {
-	// FEATURE K: Secure JWT Validation for WebSocket Upgrades
-	tokenStr := r.URL.Query().Get("token")
+func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
+	// Origin check for the upgrade (H6).
+	origin := r.Header.Get("Origin")
+	if !originAllowed(origin, h.allowedOrigins) && !sameHostOrigin(origin, r.Host) {
+		http.Error(w, "forbidden origin", http.StatusForbidden)
+		return
+	}
+
+	// Secure JWT validation for the upgrade: HS256 only, expiry required (H1).
+	// Prefer the token in the Sec-WebSocket-Protocol header so it stays out of
+	// URLs and proxy access logs (M9); fall back to ?token= for non-browser tools.
+	tokenStr := bearerFromProtocols(r.Header.Get("Sec-WebSocket-Protocol"))
+	if tokenStr == "" {
+		tokenStr = r.URL.Query().Get("token")
+	}
 	if tokenStr == "" {
 		http.Error(w, "Missing JWT token", http.StatusUnauthorized)
 		return
 	}
-
-	_, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-		return []byte(jwtSecret), nil
-	})
-
-	if err != nil {
+	token, err := jwt.Parse(
+		tokenStr,
+		func(t *jwt.Token) (interface{}, error) { return h.jwtSecret, nil },
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithExpirationRequired(),
+	)
+	if err != nil || !token.Valid {
 		http.Error(w, "Unauthorized - Invalid or Expired Token", http.StatusUnauthorized)
 		return
 	}
 
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		// Echo back only the non-secret "logstream" subprotocol; the "auth.<jwt>"
+		// entry the browser also offers is read from the request header above and
+		// never reflected.
+		Subprotocols: []string{"logstream"},
+		CheckOrigin: func(r *http.Request) bool {
+			o := r.Header.Get("Origin")
+			return originAllowed(o, h.allowedOrigins) || sameHostOrigin(o, r.Host)
+		},
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Upgrade error:", err)
+		slog.Warn("websocket upgrade failed", slog.Any("err", err))
 		return
 	}
 
 	client := &Client{
 		hub:           h,
 		conn:          conn,
-		send:          make(chan []models.LogEntry, 256),
+		send:          make(chan []models.LogEntry, clientSendBuffer),
 		serviceFilter: r.URL.Query().Get("service"),
 		levelFilter:   r.URL.Query().Get("level"),
 	}

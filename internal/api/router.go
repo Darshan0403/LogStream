@@ -4,9 +4,12 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -20,36 +23,46 @@ import (
 
 // API holds the dependencies for the HTTP handlers
 type API struct {
-	store  *storage.Store
-	engine *alerts.Engine
-	hub    *Hub   // NEW
-	apiKey string // NEW: Storing apiKey here so the websocket handler can validate it
+	store       *storage.Store
+	engine      *alerts.Engine
+	hub         *Hub
+	wsJWTSecret []byte // signs the short-lived WebSocket tokens (H1)
 }
 
 // NewRouter constructs the chi router, mounts middleware, and registers all endpoints
-func NewRouter(store *storage.Store, ingestHandler http.Handler, apiKey string, engine *alerts.Engine, hub *Hub) http.Handler {
+func NewRouter(store *storage.Store, ingestHandler http.Handler, cfg Config, engine *alerts.Engine, hub *Hub) http.Handler {
 	r := chi.NewRouter()
-	api := &API{store: store, engine: engine, hub: hub, apiKey: apiKey}
+	api := &API{store: store, engine: engine, hub: hub, wsJWTSecret: cfg.WSJWTSecret}
+
+	rateLimit := RateLimit(cfg.TrustedProxies)
 
 	// Global Middleware
+	r.Use(RequestID)
 	r.Use(Recoverer)
 	r.Use(Logger)
-	r.Use(CORS)
+	r.Use(CORS(cfg.AllowedOrigins))
 
 	// Public Routes
 	r.Get("/health", api.healthHandler)
-	r.Post("/ingest", ingestHandler.ServeHTTP)
 	r.Handle("/metrics", promhttp.Handler()) // FEATURE L: Exposed Prometheus endpoint
+
+	// Ingestion endpoint — authenticated with the ingest key and rate limited.
+	// (C1) Previously this was fully public and unthrottled.
+	r.Group(func(r chi.Router) {
+		r.Use(rateLimit)
+		r.Use(APIKeyAuth(cfg.IngestKey))
+		r.Post("/ingest", ingestHandler.ServeHTTP)
+	})
 
 	// WebSocket Route (Public, but requires valid JWT token via query param)
 	r.Get("/ws/tail", func(w http.ResponseWriter, r *http.Request) {
-		api.hub.ServeWS(w, r, api.apiKey)
+		api.hub.ServeWS(w, r)
 	})
 
 	// Protected API Routes
 	r.Route("/api", func(r chi.Router) {
-		r.Use(APIKeyAuth(apiKey))
-		r.Use(RateLimit) // 100 req/sec per IP — protects read endpoints only
+		r.Use(APIKeyAuth(cfg.APIKey))
+		r.Use(rateLimit) // per-client token bucket
 
 		// FEATURE K: JWT Dispenser for frontend WebSocket connections
 		r.Get("/ws-token", api.wsTokenHandler)
@@ -73,13 +86,24 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		fmt.Printf("Failed to encode JSON response: %v\n", err)
+		slog.Error("failed to encode JSON response", slog.Any("err", err))
 	}
 }
 
+// defaultSearchWindow bounds an otherwise-unfiltered log search so it cannot
+// scan the entire table / every partition (M2).
+const defaultSearchWindow = 30 * 24 * time.Hour
+
+// alert-rule validation limits (M5)
+const (
+	maxRulePatternLen = 500
+	maxRuleNameLen    = 200
+	maxCooldownMin    = 7 * 24 * 60 // 1 week
+	maxActiveRules    = 500
+)
+
 func (a *API) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.Ping(r.Context()); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
 		respondJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"status": "degraded",
 			"error":  "database unreachable",
@@ -89,15 +113,37 @@ func (a *API) healthHandler(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok", "service": "logstream"})
 }
 
+// validateRule enforces the alert-rule limits shared by create and update (M5).
+func validateRule(rule *models.AlertRule) string {
+	rule.Name = strings.TrimSpace(rule.Name)
+	if rule.Name == "" || rule.Pattern == "" {
+		return "name and pattern are required"
+	}
+	if len(rule.Name) > maxRuleNameLen {
+		return fmt.Sprintf("name too long (max %d)", maxRuleNameLen)
+	}
+	if len(rule.Pattern) > maxRulePatternLen {
+		return fmt.Sprintf("pattern too long (max %d)", maxRulePatternLen)
+	}
+	if _, err := regexp.Compile(rule.Pattern); err != nil {
+		return fmt.Sprintf("invalid regex pattern: %v", err)
+	}
+	if rule.CooldownMinutes < 0 || rule.CooldownMinutes > maxCooldownMin {
+		return fmt.Sprintf("cooldown_minutes must be between 0 and %d", maxCooldownMin)
+	}
+	return ""
+}
+
 // wsTokenHandler generates a short-lived JWT for the React UI to use when opening the WebSocket
 func (a *API) wsTokenHandler(w http.ResponseWriter, r *http.Request) {
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(60 * time.Second).Unix(), // Strict 60-second validity
-		"iat": time.Now().Unix(),
+	now := time.Now()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		ExpiresAt: jwt.NewNumericDate(now.Add(60 * time.Second)), // Strict 60-second validity
+		IssuedAt:  jwt.NewNumericDate(now),
 	})
 
-	// We use the server's API key as the cryptographic secret to sign the JWT
-	signed, err := token.SignedString([]byte(a.apiKey))
+	// Dedicated WS signing secret, decoupled from the API key (H1).
+	signed, err := token.SignedString(a.wsJWTSecret)
 	if err != nil {
 		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
@@ -142,6 +188,12 @@ func (a *API) searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Bound an unfiltered search to a default window so it cannot scan the whole
+	// table (M2). Callers wanting older data pass an explicit 'from'.
+	if from.IsZero() {
+		from = time.Now().Add(-defaultSearchWindow)
+	}
+
 	logs, total, err := a.store.Search(r.Context(), q, service, level, from, to, limit, offset)
 	if err != nil {
 		http.Error(w, "Failed to search logs", http.StatusInternalServerError)
@@ -169,7 +221,15 @@ func (a *API) getLogHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry, err := a.store.GetLog(r.Context(), id)
+	// Optional ?ts= hint (RFC3339) lets Postgres prune to one partition (M2).
+	var tsHint time.Time
+	if tsStr := r.URL.Query().Get("ts"); tsStr != "" {
+		if p, perr := time.Parse(time.RFC3339, tsStr); perr == nil {
+			tsHint = p
+		}
+	}
+
+	entry, err := a.store.GetLog(r.Context(), id, tsHint)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -219,20 +279,29 @@ func (a *API) servicesHandler(w http.ResponseWriter, r *http.Request) {
 // --- Alert Handlers ---
 
 func (a *API) createRuleHandler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	defer r.Body.Close()
+
 	var rule models.AlertRule
-	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+	if err := json.Unmarshal(body, &rule); err != nil {
 		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
+	// A plain bool can't tell "is_active:false" from omitted; default new rules
+	// to active (matching the DB column default) unless explicitly disabled.
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(body, &fields)
+	if _, ok := fields["is_active"]; !ok {
+		rule.IsActive = true
+	}
 
-	if rule.Name == "" || rule.Pattern == "" {
-		http.Error(w, "name and pattern are required", http.StatusBadRequest)
+	if msg := validateRule(&rule); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 
-	if _, err := regexp.Compile(rule.Pattern); err != nil {
-		http.Error(w, fmt.Sprintf("invalid regex pattern: %v", err), http.StatusBadRequest)
+	if n, err := a.store.CountRules(r.Context()); err == nil && n >= maxActiveRules {
+		http.Error(w, fmt.Sprintf("rule limit reached (max %d)", maxActiveRules), http.StatusConflict)
 		return
 	}
 
@@ -244,7 +313,7 @@ func (a *API) createRuleHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Hot-reload the engine cache
 	if err := a.engine.LoadRules(r.Context()); err != nil {
-		fmt.Printf("WARNING: Failed to reload alert rules: %v\n", err)
+		slog.ErrorContext(r.Context(), "failed to reload alert rules", slog.Any("err", err))
 	}
 	respondJSON(w, http.StatusCreated, created)
 }
@@ -276,8 +345,8 @@ func (a *API) updateRuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	if _, err := regexp.Compile(rule.Pattern); err != nil {
-		http.Error(w, fmt.Sprintf("invalid regex pattern: %v", err), http.StatusBadRequest)
+	if msg := validateRule(&rule); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
 		return
 	}
 
@@ -288,7 +357,7 @@ func (a *API) updateRuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.engine.LoadRules(r.Context()); err != nil {
-		fmt.Printf("WARNING: Failed to reload alert rules: %v\n", err)
+		slog.ErrorContext(r.Context(), "failed to reload alert rules", slog.Any("err", err))
 	}
 	respondJSON(w, http.StatusOK, updated)
 }
@@ -307,7 +376,7 @@ func (a *API) deleteRuleHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.engine.LoadRules(r.Context()); err != nil {
-		fmt.Printf("WARNING: Failed to reload alert rules: %v\n", err)
+		slog.ErrorContext(r.Context(), "failed to reload alert rules", slog.Any("err", err))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

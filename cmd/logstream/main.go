@@ -4,9 +4,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/logstream/internal/alerts"
 	"github.com/logstream/internal/api"
 	"github.com/logstream/internal/collector"
+	"github.com/logstream/internal/logging"
 	"github.com/logstream/internal/parser"
 	"github.com/logstream/internal/storage"
 	"github.com/spf13/cobra"
@@ -44,7 +47,16 @@ func buildServeCmd() *cobra.Command {
 		Use:   "serve",
 		Short: "Start the LogStream API server",
 		Run: func(cmd *cobra.Command, args []string) {
+			logging.Init(os.Getenv("LOG_FORMAT"), os.Getenv("LOG_LEVEL"))
+
 			// 1. Load Configuration (Flags override Env Vars)
+			// PORT env fills in when --port wasn't passed (L6).
+			if !cmd.Flags().Changed("port") {
+				if p, err := strconv.Atoi(os.Getenv("PORT")); err == nil && p > 0 && p < 65536 {
+					port = p
+				}
+			}
+
 			dbURL := dbURLFlag
 			if dbURL == "" {
 				dbURL = os.Getenv("DATABASE_URL")
@@ -69,15 +81,41 @@ func buildServeCmd() *cobra.Command {
 				}
 			}
 
+			// INGEST_KEY authenticates POST /ingest. Falls back to API_KEY when unset
+			// so single-key deployments keep working, but can be set separately to give
+			// log shippers a credential that cannot read/mutate the dashboard API.
+			ingestKey := os.Getenv("INGEST_KEY")
+			if ingestKey == "" {
+				ingestKey = apiKey
+			}
+
+			// C3: refuse to boot with well-known default secrets unless explicitly
+			// opted in. This prevents accidentally shipping an unauthenticated service.
+			allowInsecure := os.Getenv("ALLOW_INSECURE_DEFAULTS") == "true"
+			if !allowInsecure {
+				var problems []string
+				if apiKey == "" || apiKey == "dev-key" {
+					problems = append(problems, "API_KEY is unset or the default 'dev-key'")
+				}
+				if ingestKey == "" || ingestKey == "dev-key" {
+					problems = append(problems, "INGEST_KEY/API_KEY resolves to the default 'dev-key'")
+				}
+				if strings.Contains(dbURL, ":password@") {
+					problems = append(problems, "DATABASE_URL uses the default password 'password'")
+				}
+				if len(problems) > 0 {
+					slog.Error("refusing to start with insecure default configuration",
+						slog.Any("problems", problems),
+						slog.String("hint", "set strong values, or export ALLOW_INSECURE_DEFAULTS=true for local dev"))
+					os.Exit(1)
+				}
+			}
+
 			// INGEST_ENABLED controls whether POST /ingest accepts logs.
 			// Set to "false" for read-only public deployments.
 			// Defaults to true (dev mode, dogfooding, load tests).
 			ingestEnabled := os.Getenv("INGEST_ENABLED") != "false"
-			if ingestEnabled {
-				fmt.Println("Ingestion: ENABLED (set INGEST_ENABLED=false for read-only mode)")
-			} else {
-				fmt.Println("Ingestion: DISABLED — read-only deployment mode")
-			}
+			slog.Info("ingestion mode", slog.Bool("enabled", ingestEnabled))
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -85,36 +123,65 @@ func buildServeCmd() *cobra.Command {
 			// 2. Initialize Database
 			store, err := storage.New(ctx, dbURL)
 			if err != nil {
-				fmt.Printf("Failed to connect to database: %v\n", err)
+				slog.Error("failed to connect to database", slog.Any("err", err))
 				os.Exit(1)
 			}
 			defer store.Close()
 
-			// 3. Initialize WAL and Replay
+			// Provision the rolling window of weekly partitions, then keep it
+			// topped up in the background (M1).
+			if err := store.EnsurePartitions(ctx); err != nil {
+				slog.Warn("partition provisioning failed", slog.Any("err", err))
+			}
+			go store.RunPartitionMaintenance(ctx, 6*time.Hour)
+
+			// 3. Initialize WAL and Replay (segmented: one file per batch, H4/M7)
 			wal := collector.NewWAL(walPath)
-			recovered, err := wal.Replay()
+			segments, err := wal.Replay()
 			if err != nil {
-				fmt.Printf("WARNING: Failed to replay WAL: %v\n", err)
-			} else if len(recovered) > 0 {
-				fmt.Printf("Replaying %d logs from WAL...\n", len(recovered))
-				if err := store.InsertBatch(ctx, recovered); err != nil {
-					fmt.Printf("WARNING: WAL replay insert failed: %v\n", err)
-				} else {
-					if err := wal.Truncate(); err != nil {
-						fmt.Printf("WARNING: WAL truncate after replay failed: %v\n", err)
-					}
-					fmt.Printf("WAL replay complete. %d logs recovered.\n", len(recovered))
+				slog.Warn("failed to replay WAL", slog.Any("err", err))
+			}
+			var replayed, quarantined int
+			for _, seg := range segments {
+				if err := store.InsertBatch(ctx, seg.Entries); err != nil {
+					slog.Warn("WAL replay of segment failed", slog.String("segment", seg.Path), slog.Any("err", err))
+					wal.QuarantineSegments([]string{seg.Path})
+					quarantined++
+					continue
 				}
+				wal.RemoveSegments([]string{seg.Path})
+				replayed += len(seg.Entries)
+			}
+			if replayed > 0 || quarantined > 0 {
+				slog.Info("WAL replay complete", slog.Int("logs_recovered", replayed), slog.Int("segments_quarantined", quarantined))
 			}
 
 			// 4. Wire Dependencies
 			alertEngine := alerts.NewEngine(store)
 			if err := alertEngine.LoadRules(ctx); err != nil {
-				fmt.Printf("WARNING: Failed to load alert rules on startup: %v\n", err)
+				slog.Warn("failed to load alert rules on startup", slog.Any("err", err))
+			}
+
+			// Security configuration for the HTTP/WS layer (H1, H2, H6).
+			wsSecret := api.DeriveWSSecret(os.Getenv("WS_JWT_SECRET"), apiKey)
+			trustedProxies := api.DefaultTrustedProxies()
+			if tp := os.Getenv("TRUSTED_PROXIES"); tp != "" {
+				trustedProxies = api.ParseCIDRs(tp)
+			}
+			allowedOrigins := api.ParseOrigins(os.Getenv("ALLOWED_ORIGINS"))
+			if len(allowedOrigins) == 0 {
+				slog.Warn("ALLOWED_ORIGINS not set; cross-origin browsers refused (same-origin only)")
+			}
+			apiCfg := api.Config{
+				APIKey:         apiKey,
+				IngestKey:      ingestKey,
+				WSJWTSecret:    wsSecret,
+				AllowedOrigins: allowedOrigins,
+				TrustedProxies: trustedProxies,
 			}
 
 			// NEW: Initialize WebSocket Hub and start its broadcast loop
-			hub := api.NewHub()
+			hub := api.NewHub(wsSecret, allowedOrigins)
 			go hub.Run()
 
 			jsonParser := &parser.JSONParser{}
@@ -127,7 +194,7 @@ func buildServeCmd() *cobra.Command {
 
 			// 6. Setup API Router
 			// UPDATED: Pass hub to Router
-			router := api.NewRouter(store, httpHandler, apiKey, alertEngine, hub)
+			router := api.NewRouter(store, httpHandler, apiCfg, alertEngine, hub)
 
 			serverAddr := fmt.Sprintf(":%d", port)
 			server := &http.Server{
@@ -137,9 +204,9 @@ func buildServeCmd() *cobra.Command {
 
 			// 7. Start Server in background
 			go func() {
-				fmt.Printf("LogStream API & Ingestion Server running on %s\n", serverAddr)
+				slog.Info("server listening", slog.String("addr", serverAddr))
 				if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					fmt.Printf("Server failed: %v\n", err)
+					slog.Error("server failed", slog.Any("err", err))
 				}
 			}()
 
@@ -148,7 +215,7 @@ func buildServeCmd() *cobra.Command {
 			signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 			<-sigChan
-			fmt.Println("\nReceived shutdown signal. Draining...")
+			slog.Info("shutdown signal received, draining")
 
 			cancel()
 			<-batcher.Done()
@@ -156,10 +223,10 @@ func buildServeCmd() *cobra.Command {
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer shutdownCancel()
 			if err := server.Shutdown(shutdownCtx); err != nil {
-				fmt.Printf("HTTP server shutdown error: %v\n", err)
+				slog.Error("HTTP server shutdown error", slog.Any("err", err))
 			}
 
-			fmt.Println("LogStream shut down gracefully.")
+			slog.Info("shutdown complete")
 		},
 	}
 
