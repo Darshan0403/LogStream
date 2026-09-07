@@ -3,7 +3,7 @@ package alerts
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"regexp"
 	"sync"
 	"time"
@@ -48,7 +48,7 @@ func (e *Engine) LoadRules(ctx context.Context) error {
 
 		compiled, err := regexp.Compile(r.Pattern)
 		if err != nil {
-			fmt.Printf("WARNING: Failed to compile regex for rule '%s': %v\n", r.Name, err)
+			slog.WarnContext(ctx, "alert rule regex failed to compile", slog.String("rule", r.Name), slog.Any("err", err))
 			continue
 		}
 
@@ -62,17 +62,24 @@ func (e *Engine) LoadRules(ctx context.Context) error {
 	e.cache = newCache
 	e.cacheMu.Unlock()
 
-	fmt.Printf("Alert Engine: Loaded %d active rules.\n", len(newCache))
+	slog.InfoContext(ctx, "alert engine reloaded", slog.Int("active_rules", len(newCache)))
 	return nil
 }
 
 func (e *Engine) Check(ctx context.Context, batch []models.LogEntry) {
+	// Snapshot the compiled rules under a short lock, then evaluate without it so
+	// regex matching never blocks a LoadRules() swap and vice versa (M6).
+	// compiledRule values are immutable — LoadRules builds a fresh map each time.
 	e.cacheMu.RLock()
-	defer e.cacheMu.RUnlock()
+	rules := make([]*compiledRule, 0, len(e.cache))
+	for _, cr := range e.cache {
+		rules = append(rules, cr)
+	}
+	e.cacheMu.RUnlock()
 
 	now := time.Now()
 
-	for _, cr := range e.cache {
+	for _, cr := range rules {
 		for _, log := range batch {
 			if cr.rule.LevelFilter != nil && *cr.rule.LevelFilter != log.Level {
 				continue
@@ -96,7 +103,7 @@ func (e *Engine) Check(ctx context.Context, batch []models.LogEntry) {
 
 			// Fire Alert and update cooldown safely
 			if err := e.store.CreateAlert(ctx, cr.rule.ID, log.ID, log.Timestamp); err != nil {
-				fmt.Printf("ERROR: Failed to save alert for rule '%s': %v\n", cr.rule.Name, err)
+				slog.ErrorContext(ctx, "failed to save fired alert", slog.String("rule", cr.rule.Name), slog.Any("err", err))
 				e.cooldownMu.Unlock()
 				continue
 			}
@@ -104,7 +111,7 @@ func (e *Engine) Check(ctx context.Context, batch []models.LogEntry) {
 			e.lastFired[cr.rule.ID] = now
 			e.cooldownMu.Unlock()
 
-			fmt.Printf(" ALERT [%s]: '%s' matched log #%d from %s\n", cr.rule.Name, cr.rule.Pattern, log.ID, log.Service)
+			slog.InfoContext(ctx, "alert fired", slog.String("rule", cr.rule.Name), slog.String("pattern", cr.rule.Pattern), slog.Int64("log_id", log.ID), slog.String("service", log.Service))
 			break
 		}
 	}

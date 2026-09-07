@@ -110,7 +110,7 @@ func (p *DockerParser) parseFlexibleJSON(data []byte) (models.LogEntry, bool) {
 	// Step 3: Build Metadata from all remaining fields not consumed above
 	knownKeys := map[string]bool{
 		"message": true, "msg": true,
-		"level": true,
+		"level":     true,
 		"timestamp": true, "time": true,
 		"service": true,
 	}
@@ -129,7 +129,6 @@ func (p *DockerParser) parseFlexibleJSON(data []byte) (models.LogEntry, bool) {
 		Metadata:  metadata,
 	}, true
 }
-
 
 func (p *DockerParser) Parse(data []byte) (models.LogEntry, error) {
 	// 1. Try flexible JSON first — handles VOID Go services (msg/time)
