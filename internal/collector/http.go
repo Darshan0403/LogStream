@@ -2,13 +2,28 @@
 package collector
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
+	"sync"
+	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/logstream/internal/parser"
 	"github.com/prometheus/client_golang/prometheus"
+)
+
+const (
+	maxBatchBytes   = 10 << 20 // 10 MiB request body
+	maxBatchEntries = 1000
+	// maxMetadataBytes bounds the JSONB blob a client can attach to a single log
+	// entry, so 1000 entries can't smuggle a huge payload past the body cap (L12).
+	maxMetadataBytes = 16 << 10         // 16 KiB
+	idempTTL         = 10 * time.Minute // idempotency keys expire (L9)
+	idempCapacity    = 10000
 )
 
 var LogsIngestedTotal = prometheus.NewCounter(prometheus.CounterOpts{
@@ -24,81 +39,109 @@ type HTTPHandler struct {
 	batcher       *Batcher
 	parser        parser.LogParser
 	ingestEnabled bool
-	idempCache    *lru.Cache[string, struct{}]
+
+	idempMu    sync.Mutex
+	idempCache *expirable.LRU[string, struct{}]
 }
 
 func NewHTTPHandler(b *Batcher, p parser.LogParser, ingestEnabled bool) *HTTPHandler {
-	// 10,000 capacity HashiCorp LRU cache
-	cache, _ := lru.New[string, struct{}](10000)
-
 	return &HTTPHandler{
 		batcher:       b,
 		parser:        p,
 		ingestEnabled: ingestEnabled,
-		idempCache:    cache,
+		idempCache:    expirable.NewLRU[string, struct{}](idempCapacity, nil, idempTTL),
 	}
+}
+
+// seenIdempKey atomically reports whether key was already seen, recording it if not.
+func (h *HTTPHandler) seenIdempKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	h.idempMu.Lock()
+	defer h.idempMu.Unlock()
+	if h.idempCache.Contains(key) {
+		return true
+	}
+	h.idempCache.Add(key, struct{}{})
+	return false
+}
+
+func (h *HTTPHandler) releaseIdempKey(key string) {
+	if key == "" {
+		return
+	}
+	h.idempMu.Lock()
+	h.idempCache.Remove(key)
+	h.idempMu.Unlock()
 }
 
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.ingestEnabled {
-		http.Error(w, `{"error":"ingestion disabled"}`, http.StatusForbidden)
+		writeJSONError(w, http.StatusForbidden, "ingestion disabled")
 		return
 	}
 
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 
-	// 1. CHECK & LOCK THE IDEMPOTENCY KEY INSTANTLY
-	idempKey := r.Header.Get("X-Idempotency-Key")
-	if idempKey != "" {
-		// ContainsOrAdd checks if it exists, AND adds it atomically in one step!
-		// This prevents the race condition when double-curling rapidly.
-		if exists, _ := h.idempCache.ContainsOrAdd(idempKey, struct{}{}); exists {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusAccepted)
-			fmt.Fprintf(w, `{"status":"accepted","ingested":0,"note":"duplicate_ignored"}`)
+	// Require a JSON content type when one is provided (L7). An empty header is
+	// tolerated for minimal clients / curl.
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		if mt, _, _ := strings.Cut(ct, ";"); strings.TrimSpace(mt) != "application/json" {
+			writeJSONError(w, http.StatusUnsupportedMediaType, "expected application/json")
 			return
 		}
 	}
 
-	r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+	idempKey := r.Header.Get("X-Idempotency-Key")
+	if h.seenIdempKey(idempKey) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"status":"accepted","ingested":0,"note":"duplicate_ignored"}`)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		// If payload fails, remove the key so it can be retried properly
-		if idempKey != "" {
-			h.idempCache.Remove(idempKey)
-		}
-		http.Error(w, "Payload too large", http.StatusRequestEntityTooLarge)
+		h.releaseIdempKey(idempKey)
+		writeJSONError(w, http.StatusRequestEntityTooLarge, "payload too large")
 		return
 	}
 	defer r.Body.Close()
 
 	entries, err := h.parser.ParseBatch(body)
 	if err != nil {
-		if idempKey != "" {
-			h.idempCache.Remove(idempKey)
-		}
-		http.Error(w, fmt.Sprintf("Failed to parse: %v", err), http.StatusBadRequest)
+		h.releaseIdempKey(idempKey)
+		// Don't echo the raw parser error back to the client (L7).
+		slog.WarnContext(r.Context(), "ingest parse failure", slog.String("remote", r.RemoteAddr), slog.Any("err", err))
+		writeJSONError(w, http.StatusBadRequest, "invalid log payload")
 		return
 	}
 
-	if len(entries) > 1000 {
-		if idempKey != "" {
-			h.idempCache.Remove(idempKey)
-		}
-		http.Error(w, "max 1000 logs per batch", http.StatusBadRequest)
+	if len(entries) > maxBatchEntries {
+		h.releaseIdempKey(idempKey)
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("max %d logs per batch", maxBatchEntries))
 		return
+	}
+
+	for i := range entries {
+		if n := metadataSize(entries[i].Metadata); n > maxMetadataBytes {
+			h.releaseIdempKey(idempKey)
+			writeJSONError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("entry %d metadata too large (%d bytes, max %d)", i, n, maxMetadataBytes))
+			return
+		}
 	}
 
 	for _, entry := range entries {
 		if err := h.batcher.Send(entry); err != nil {
-			if idempKey != "" {
-				h.idempCache.Remove(idempKey)
-			}
+			h.releaseIdempKey(idempKey)
 			w.Header().Set("Retry-After", "1")
-			http.Error(w, "server busy", http.StatusServiceUnavailable)
+			writeJSONError(w, http.StatusServiceUnavailable, "server busy")
 			return
 		}
 	}
@@ -108,4 +151,22 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	fmt.Fprintf(w, `{"status":"accepted","ingested":%d}`, len(entries))
+}
+
+func metadataSize(m map[string]any) int {
+	if len(m) == 0 {
+		return 0
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return maxMetadataBytes + 1 // unserialisable → reject
+	}
+	return len(b)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	b, _ := json.Marshal(map[string]string{"error": msg})
+	w.Write(b)
 }

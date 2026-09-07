@@ -53,13 +53,17 @@ func (s *StdinCollector) Run(ctx context.Context) {
 	lines := make(chan string)
 
 	go func() {
+		defer close(lines)
 		for scanner.Scan() {
-			lines <- scanner.Text()
+			select {
+			case lines <- scanner.Text():
+			case <-ctx.Done():
+				return // don't block forever on send once the consumer has stopped (L8)
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			fmt.Printf("[collect:%s] Scanner error: %v\n", s.service, err)
 		}
-		close(lines)
 	}()
 
 	var buffer strings.Builder
